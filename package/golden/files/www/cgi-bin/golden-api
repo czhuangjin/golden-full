@@ -1,0 +1,3052 @@
+#!/usr/bin/lua
+-- ============================================================
+-- 黄金定制 完整版 — 后端数据接口 v3（OpenWrt / uhttpd CGI）
+-- 读取: GET  ?action=get&name=sysinfo|laninfo|waninfo|hosts|arp|traffic|conns|logs|processes|lbstatus|upnp|ddns|qos|config
+--       兼容 v1: ?action=sysinfo 直接返回
+-- 批5:   + secevents（安全事件聚合）| banlist（封禁列表）| dnsaudit|dnsauditlogs（上网行为审计）
+-- 写入: POST body=JSON {"domain":"network.wan","config":{...}}
+-- 操作: POST ?action=run&name=ping|reboot|poweroff|reset|restartservice|backup|restore|upgrade|upgrade-confirm|ctcnc-*|login-banlist|login-unban|arplog-clear|dnsblock-clear|dnsaudit-clear|block-ip|unblock-ip
+-- 安全: token 一律走请求头 X-Golden-Token（不再接受 URL 参数）；
+--       危险/有副作用操作强制 POST（CSRF 防护）；会话绑定来源 IP；
+--       登录失败达阈值 → 应用层锁定 + iptables recent 封禁双保险
+-- 输出: {"ok":true,"error":"","payload":{...}}
+-- 说明: 纯 Lua 5.1，无第三方依赖
+-- ============================================================
+
+local query = os.getenv('QUERY_STRING') or ''
+local args = {}
+for k, v in query:gmatch('([%w_]+)=([^&]*)') do args[k] = v end
+
+-- ==================== JSON 编码器 ====================
+local function esc(s)
+  s = tostring(s or '')
+  s = s:gsub('\\', '\\\\'):gsub('"', '\\"'):gsub('\n', '\\n'):gsub('\r', '\\r'):gsub('\t', '\\t')
+  return s
+end
+local function jenc(o)
+  local t = type(o)
+  if t == 'table' then
+    local n = #o
+    if n > 0 then
+      local parts = {}
+      for i = 1, n do parts[i] = jenc(o[i]) end
+      return '[' .. table.concat(parts, ',') .. ']'
+    else
+      local parts = {}
+      for k, v in pairs(o) do parts[#parts + 1] = '"' .. esc(k) .. '":' .. jenc(v) end
+      return '{' .. table.concat(parts, ',') .. '}'
+    end
+  elseif t == 'number' then return tostring(o)
+  elseif t == 'boolean' then return o and 'true' or 'false'
+  else return '"' .. esc(o) .. '"' end
+end
+
+-- ==================== 最小 JSON 解析器（lua5.1） ====================
+local function json_parse(str)
+  local idx = 1
+  local function skip()
+    while str:sub(idx, idx):match('%s') do idx = idx + 1 end
+  end
+  local function parse()
+    skip()
+    local c = str:sub(idx, idx)
+    if c == '{' then
+      idx = idx + 1; skip()
+      local obj = {}
+      if str:sub(idx, idx) == '}' then idx = idx + 1 return obj end
+      while true do
+        local key = parse(); skip()
+        if str:sub(idx, idx) ~= ':' then error('expected :') end
+        idx = idx + 1
+        obj[key] = parse(); skip()
+        local cc = str:sub(idx, idx)
+        if cc == ',' then idx = idx + 1
+        elseif cc == '}' then idx = idx + 1 return obj
+        else error('bad obj') end
+      end
+    elseif c == '[' then
+      idx = idx + 1; skip()
+      local arr = {}
+      if str:sub(idx, idx) == ']' then idx = idx + 1 return arr end
+      while true do
+        arr[#arr + 1] = parse(); skip()
+        local cc = str:sub(idx, idx)
+        if cc == ',' then idx = idx + 1
+        elseif cc == ']' then idx = idx + 1 return arr
+        else error('bad arr') end
+      end
+    elseif c == '"' then
+      idx = idx + 1
+      local out = ''
+      while true do
+        local ch = str:sub(idx, idx)
+        if ch == '"' then idx = idx + 1 return out end
+        if ch == '\\' then
+          idx = idx + 1
+          local e = str:sub(idx, idx)
+          if e == 'n' then out = out .. '\n'
+          elseif e == 't' then out = out .. '\t'
+          elseif e == 'r' then out = out .. '\r'
+          elseif e == 'u' then
+            local code = tonumber(str:sub(idx + 1, idx + 4), 16)
+            out = out .. (code and string.char(code % 256) or '')
+            idx = idx + 4
+          else out = out .. e end
+          idx = idx + 1
+        else
+          out = out .. ch
+          idx = idx + 1
+        end
+      end
+    elseif c == '-' or (c and c:match('%d')) then
+      local num = str:match('^-?%d+%.?%d*[eE]?[+-]?%d*', idx) or '0'
+      idx = idx + #num
+      return tonumber(num)
+    elseif c == 't' then idx = idx + 4 return true
+    elseif c == 'f' then idx = idx + 5 return false
+    elseif c == 'n' then idx = idx + 4 return nil
+    else error('bad char ' .. tostring(c)) end
+  end
+  return parse()
+end
+
+-- ==================== 工具函数 ====================
+local function sh(cmd)
+  local f = io.popen(cmd .. ' 2>/dev/null', 'r')
+  if not f then return '' end
+  local s = f:read('*a') or ''
+  f:close()
+  return (s:gsub('[\r\n]+$', ''))
+end
+local function readFile(path)
+  local f = io.open(path, 'r')
+  if not f then return '' end
+  local s = f:read('*a') or ''
+  f:close()
+  return s
+end
+local function urldecode(s)
+  s = s:gsub('%+', ' ')  -- '+' 是 Lua pattern 魔法字符，必须转义，否则整段 URL 解码抛 malformed pattern
+  return (s:gsub('%%(%x%x)', function(h) return string.char(tonumber(h, 16)) end))
+end
+local function sanitize(v, pat)
+  v = tostring(v or '')
+  if pat and not v:match(pat) then return '' end
+  return (v:gsub("[';`$|&<>]", ''))
+end
+local function cidrToMask(n)
+  n = tonumber(n) or 24
+  if n < 0 then n = 0 end
+  if n > 32 then n = 32 end
+  local mask = 0
+  for i = 0, 31 do if i < n then mask = mask + 2 ^ (31 - i) end end
+  local a = math.floor(mask / 16777216)
+  local b = math.floor((mask % 16777216) / 65536)
+  local c = math.floor((mask % 65536) / 256)
+  local d = math.floor(mask % 256)
+  return a .. '.' .. b .. '.' .. c .. '.' .. d
+end
+local IPPAT = '^%d+%.%d+%.%d+%.%d+$'
+local MACPAT = '^%x%x:%x%x:%x%x:%x%x:%x%x:%x%x$'
+
+-- 纯 Lua base64 编解码（busybox 默认不编译 base64 applet，CONFIG_BUSYBOX_DEFAULT_BASE64=n）
+local B64C = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+local function b64encode(data)
+  local out = {}
+  for i = 1, #data, 3 do
+    local a, b, c = data:byte(i, i + 2)
+    local n = a * 65536 + (b or 0) * 256 + (c or 0)
+    local q = {}
+    for j = 3, 0, -1 do
+      local v = math.floor(n / 64 ^ j) % 64
+      q[#q + 1] = B64C:sub(v + 1, v + 1)
+    end
+    local s = table.concat(q)
+    if not c then s = s:sub(1, 3) .. '=' end
+    if not b then s = s:sub(1, 2) .. '==' end
+    out[#out + 1] = s
+  end
+  return table.concat(out)
+end
+local function b64decode(str)
+  str = str:gsub('[^' .. B64C .. '=]', '')
+  local out = {}
+  for chunk in str:gmatch('....') do
+    local n = 0
+    for i = 1, 4 do
+      local ch = chunk:sub(i, i)
+      if ch ~= '=' then n = n * 64 + (B64C:find(ch, 1, true) - 1) else n = n * 64 end
+    end
+    out[#out + 1] = string.char(math.floor(n / 65536) % 256, math.floor(n / 256) % 256, n % 256)
+  end
+  return table.concat(out)
+end
+
+-- ==================== 认证 / 会话管理 ====================
+-- 带错误码的异常：error({code=401, msg='...'}) → 输出 {ok:false, code:401, error:'...'}
+local SESSION_DIR = '/tmp/golden_sessions'
+local LOCK_DIR = '/tmp/golden_lock'
+
+-- token 统一从请求头 X-Golden-Token 获取（不再接受 URL 参数，避免 token 泄露到 uhttpd 访问日志 / Referer）
+local function headerToken()
+  return os.getenv('HTTP_X_GOLDEN_TOKEN') or ''
+end
+
+-- 读取 POST body（限量，防内存耗尽）
+local function readPostBody(maxSize)
+  local method = os.getenv('REQUEST_METHOD') or 'GET'
+  if method ~= 'POST' then return '' end
+  local cl = tonumber(os.getenv('CONTENT_LENGTH') or '0') or 0
+  if cl <= 0 or cl > (maxSize or 1048576) then return '' end
+  return io.read(cl) or ''
+end
+
+-- 危险/有副作用操作必须 POST（CSRF 防护：GET 可被 <img>/<script> 触发）
+local function requirePost()
+  local m = os.getenv('REQUEST_METHOD') or 'GET'
+  if m ~= 'POST' then error({ code = 405, msg = '该操作需要通过 POST 请求执行' }) end
+end
+
+-- 登录失败达阈值 → iptables recent 封禁来源 IP（双保险：应用层锁定 + 内核层封禁）
+-- 封禁时长由 golden-fw 按 UCI system.@system[0].golden_ban_seconds 执行（默认 600 秒；
+-- 设 0 表示只做应用层锁定、不下发内核封禁）。被封后重启路由器即可解除（recent 表在内存）。
+local BAN_SECONDS = tonumber(sh("uci get system.@system[0].golden_ban_seconds 2>/dev/null")) or 600
+local function banIpByIptables(ip)
+  if not ip or ip == '' or ip == 'local' then return end
+  os.execute("iptables -C golden_login -m recent --name glb --set -j DROP -s " .. ip .. " 2>/dev/null || iptables -A golden_login -m recent --name glb --set -j DROP -s " .. ip .. " 2>/dev/null")
+end
+
+local function getClientIp()
+  return os.getenv('REMOTE_ADDR') or 'local'
+end
+
+-- 验证系统密码：busybox cryptpw 按 /etc/shadow 的算法与 salt 重新计算比对
+local function verifyPassword(user, pass)
+  user = sanitize(user, '^[%w_]+$')
+  if user == '' or not pass or pass == '' then return false end
+  local line = sh("grep '^" .. user .. ":' /etc/shadow 2>/dev/null")
+  local hash = line:match('^[^:]+:([^:]*)')
+  if not hash or hash == '' or hash:sub(1, 1) == '!' or hash:sub(1, 1) == '*' then
+    -- 账户锁定或 /etc/shadow 无该用户 → 直接失败（不落应急通道，避免绕过锁定）
+    return false
+  end
+  local id, salt, enc = hash:match('^%$(%w+)%$([^$]*)%$([^$]*)')
+  if not id or id == '' or salt == '' or enc == '' then return false end
+  local alg = (id == '1' and 'md5') or (id == '5' and 'sha256') or (id == '6' and 'sha512') or ''
+  if alg == '' then return false end
+  local safe = tostring(pass):gsub("'", "'\\''")
+  -- ★ 主通道：cryptpw 按 /etc/shadow 的真实算法+salt 重算比对。shadow 哈希是权威凭证，
+  --   固件已按 CONFIG_BUSYBOX_DEFAULT_CRYPTPW=y 编入 cryptpw（v1.1.8 起），此处必然可判定。
+  local out = sh("echo '" .. safe .. "' | busybox cryptpw -a " .. alg .. " -S '" .. salt .. "' 2>/dev/null")
+  local newEnc = out:match('^%$%w+%$[^$]*%$([^$]*)')
+  if newEnc ~= '' and newEnc == enc then return true end
+  -- 降级通道①：固件无 cryptpw 时借道 dropbear 自带客户端 dbclient 验证（DROPBEAR_PASSWORD 环境变量）
+  -- 判定必须用「肯定信号」：只有真实登录成功、远端命令执行输出了标记才放行。
+  -- （旧写法按「输出不含 login failed/refused」推断成功，而 dbclient 密码错误的实际文案是
+  --   "Password auth failed"，两个模式都不含 → 错误密码被放行，v1.1.7 已修）
+  if sh("command -v dbclient 2>/dev/null") ~= '' then
+    local f = io.popen("DROPBEAR_PASSWORD='" .. safe .. "' dbclient -y " .. user .. "@127.0.0.1 'echo GOLDEN_AUTH_OK' 2>/dev/null", 'r')
+    local o = f and f:read('*a') or ''
+    if f then f:close() end
+    if o:match('GOLDEN_AUTH_OK') then return true end
+  end
+  -- 降级通道②（最后兜底）：uci 显式配置 golden_web_pass 明文时比对。
+  --   【v1.1.10 安全加固】由「置于最前」移到「最后」：shadow 哈希（主通道）与 dbclient 均
+  --   失败时才启用，且绝不绕过账户锁定。避免「shadow 已是新密码、golden_web_pass 仍是旧值」
+  --   时旧密码仍能登录的凭证不一致问题；仅当设备连 cryptpw+dbclient 都没有（纯手工应急，
+  --   如 SSH 里 uci set system.golden_web_pass='xxx'）才放行，保证 Web 永不锁死。
+  local upass = sh("uci -q get system.@system[0].golden_web_pass 2>/dev/null")
+  if upass ~= '' and upass == tostring(pass) then return true end
+  return false
+end
+
+local function sessionToken()
+  -- 注意：OpenWrt busybox 默认不编 od（BUSYBOX_DEFAULT_OD=n），严禁依赖 od 做十六进制转换
+  -- 首选 tr 直接从 /dev/urandom 取十六进制字符（tr/head 必然内置）
+  local t = sh("tr -dc 'a-f0-9' < /dev/urandom 2>/dev/null | head -c 64")
+  if t == '' or #t < 32 then
+    -- 纯 Lua 兜底：时间 + 时钟微秒做种子，保证任何精简固件都能出 token
+    math.randomseed(os.time() * 1000 + math.floor((os.clock() % 1) * 1000000))
+    local chars = '0123456789abcdef'
+    t = ''
+    for _ = 1, 64 do
+      local i = math.random(1, #chars)
+      t = t .. chars:sub(i, i)
+    end
+  end
+  return t
+end
+
+local function createSession(user, role, ip)
+  local token = sessionToken()
+  if token == '' then return nil end
+  os.execute('mkdir -p ' .. SESSION_DIR .. '; chmod 700 ' .. SESSION_DIR)
+  local path = SESSION_DIR .. '/' .. token
+  local now = os.time()
+  local f = io.open(path, 'w')
+  if not f then return nil end
+  f:write('user=' .. user .. '\nrole=' .. role .. '\nip=' .. (ip or '') .. '\nlogin=' .. now .. '\nlast=' .. now .. '\n')
+  f:close()
+  os.execute('chmod 600 ' .. path)
+  return token
+end
+
+local function checkSession(token)
+  if not token or not token:match('^[%w]+$') then return nil end
+  local path = SESSION_DIR .. '/' .. token
+  local content = readFile(path)
+  if content == '' then return nil end
+  local user = content:match('^user=([^\n]+)')
+  local role = content:match('^role=([^\n]+)')
+  local sessIp = content:match('^ip=([^\n]+)')
+  local last = tonumber(content:match('^last=(%d+)'))
+  local timeout = tonumber(sh("uci get system.@system[0].golden_session_timeout 2>/dev/null")) or 15
+  local now = os.time()
+  -- 会话绑定来源 IP：换 IP 即视为 token 泄露，作废会话
+  local curIp = getClientIp()
+  if sessIp and sessIp ~= '' and curIp ~= 'local' and sessIp ~= curIp then
+    os.execute('rm -f ' .. path)
+    return nil
+  end
+  if not last or (now - last) > timeout * 60 then
+    os.execute('rm -f ' .. path)
+    return nil
+  end
+  os.execute("sed -i 's/^last=.*/last=" .. now .. "/' " .. path .. " 2>/dev/null")
+  return { user = user, role = role }
+end
+
+local function destroySession(token)
+  if token and token:match('^[%w]+$') then
+    os.execute('rm -f ' .. SESSION_DIR .. '/' .. token)
+  end
+end
+
+-- 登录失败锁定（按来源 IP，超过 golden_login_lock 次锁定；达阈值同时下发 iptables 封禁双保险）
+-- 锁文件第 1 行=失败次数，第 2 行=首次失败时间戳；锁定 30 分钟后自动解锁（否则误输 5 次后永久锁死）
+local LOCK_EXPIRE = 1800
+local clearFail  -- 前置声明：lockedOut 过期自动解锁时需要调用
+local function failCount(ip)
+  return tonumber(sh("head -n1 " .. LOCK_DIR .. '/' .. ip .. " 2>/dev/null")) or 0
+end
+local function failTime(ip)
+  return tonumber(sh("sed -n '2p' " .. LOCK_DIR .. '/' .. ip .. " 2>/dev/null")) or 0
+end
+local function lockedOut(ip)
+  local max = tonumber(sh("uci get system.@system[0].golden_login_lock 2>/dev/null")) or 5
+  if failCount(ip) < max then return false end
+  local t0 = failTime(ip)
+  if t0 > 0 and (os.time() - t0) >= LOCK_EXPIRE then
+    clearFail(ip)
+    return false
+  end
+  return true
+end
+local function recordFail(ip)
+  os.execute('mkdir -p ' .. LOCK_DIR)
+  local n = failCount(ip) + 1
+  local t0 = failTime(ip)
+  if t0 <= 0 then t0 = os.time() end
+  os.execute('echo ' .. n .. ' > ' .. LOCK_DIR .. '/' .. ip)
+  os.execute('echo ' .. t0 .. ' >> ' .. LOCK_DIR .. '/' .. ip)
+  local max = tonumber(sh("uci get system.@system[0].golden_login_lock 2>/dev/null")) or 5
+  if n >= max then
+    banIpByIptables(ip)
+    os.execute("logger -t golden-auth 'login brute-force banned " .. ip .. "' 2>/dev/null")
+  end
+end
+clearFail = function(ip)
+  os.execute('rm -f ' .. LOCK_DIR .. '/' .. ip)
+end
+
+-- 登录用户名 → 系统账户/角色 映射（支持 WEB 访问设置中的别名）
+-- 返回 account(实际 shadow 账户), role(admin/guest), display(界面显示名)
+local function resolveLogin(loginName)
+  local adminAlias = sh("uci get system.@system[0].golden_admin_user 2>/dev/null") or 'root'
+  local guestAlias = sh("uci get system.@system[0].golden_guest_user 2>/dev/null") or 'guest'
+  if loginName == 'root' or (adminAlias ~= '' and loginName == adminAlias) then
+    return 'root', 'admin', loginName
+  elseif loginName == 'guest' or (guestAlias ~= '' and loginName == guestAlias) then
+    return 'guest', 'guest', loginName
+  end
+  return nil
+end
+
+local function authLogin(cfg)
+  cfg = cfg or {}
+  local loginName = sanitize(cfg.user, '^[%w_]+$')
+  local pass = tostring(cfg.pass or '')
+  local ip = getClientIp()
+  if loginName == '' or pass == '' then error('用户名或密码不能为空') end
+  if lockedOut(ip) then error('登录失败次数过多，请稍后再试') end
+  local account, role, display = resolveLogin(loginName)
+  if not account then error('不支持的登录用户') end
+  if not verifyPassword(account, pass) then
+    recordFail(ip)
+    error('用户名或密码错误')
+  end
+  clearFail(ip)
+  local token = createSession(display, role, ip)
+  if not token then error('会话创建失败，请重试') end
+  local resp = { token = token, role = role, user = display, firstLogin = false }
+  if role == 'admin' then
+    resp.firstLogin = (sh("uci get system.@system[0].golden_first_login 2>/dev/null") == '1')
+  end
+  return resp
+end
+
+local function authCheck(token)
+  if not token or token == '' then return { authenticated = false } end
+  local s = checkSession(token)
+  if not s then return { authenticated = false } end
+  return { authenticated = true, role = s.role, user = s.user }
+end
+
+local function authLogout(token)
+  destroySession(token)
+  return { loggedOut = true }
+end
+
+-- ==================== UCI 封装 ====================
+local function uciSet(section, option, value)
+  if value == nil or value == '' then
+    os.execute("uci delete " .. section .. "." .. option .. " 2>/dev/null")
+  else
+    value = tostring(value):gsub("'", "'\\''")
+    os.execute("uci set " .. section .. "." .. option .. "='" .. value .. "'")
+  end
+end
+local function uciAddList(section, option, value)
+  value = tostring(value):gsub("'", "'\\''")
+  os.execute("uci add_list " .. section .. "." .. option .. "='" .. value .. "'")
+end
+local function uciCommit(section) os.execute("uci commit " .. section .. " 2>/dev/null") end
+
+-- ==================== 读取：系统信息 ====================
+local function getSysinfo()
+  local info = {}
+  local up = readFile('/proc/uptime'):match('^([%d%.]+)') or '0'
+  local sec = math.floor(tonumber(up) or 0)
+  local d = math.floor(sec / 86400)
+  local h = math.floor((sec % 86400) / 3600)
+  local m = math.floor((sec % 3600) / 60)
+  local s = sec % 60
+  local function pad(x) return string.format('%02d', x) end
+  info.runTime = (d > 0 and (d .. '天' .. pad(h) .. '时' .. pad(m) .. '分' .. pad(s) .. '秒'))
+    or (h .. '时' .. pad(m) .. '分' .. pad(s) .. '秒')
+  local cpuinfo = readFile('/proc/cpuinfo')
+  info.cpuModel = cpuinfo:match('model name%s*:%s*([^\n]+)') or ''
+  info.cpuCores = 0
+  for _ in cpuinfo:gmatch('processor%s*:%s*') do info.cpuCores = info.cpuCores + 1 end
+  info.cpuFreq = cpuinfo:match('cpu MHz%s*:%s*([^\n]+)') or ''
+  info.load = readFile('/proc/loadavg'):match('^([%d%.]+%s+[%d%.]+%s+[%d%.]+)') or '0 0 0'
+  local mem = readFile('/proc/meminfo')
+  local mt = tonumber(mem:match('MemTotal:%s*(%d+)')) or 0
+  local ma = tonumber(mem:match('MemAvailable:%s*(%d+)')) or 0
+  info.memTotalG = string.format('%.2f', mt / 1024 / 1024)
+  info.memFreeG = string.format('%.2f', ma / 1024 / 1024)
+  local nf = readFile('/proc/net/nf_conntrack')
+  local conns = 0
+  for _ in nf:gmatch('[^\n]+') do conns = conns + 1 end
+  info.currentConn = conns
+  info.connCapacity = sh("cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null") or ''
+  local tmp = sh("cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null")
+  local t = tonumber(tmp)
+  info.temp = t and string.format('%.1f', t / 1000) or ''
+  info.release = readFile('/etc/openwrt_release'):match('DISTRIB_DESCRIPTION=%s*["\']([^"\']+)') or 'OpenWrt'
+  info.hostname = readFile('/proc/sys/kernel/hostname'):gsub('%s+$', '')
+  info.goldenVersion = '黄金定制 H-2.01.779'
+  return info
+end
+
+-- ==================== 读取：局域网 ====================
+local function getLaninfo()
+  local info = {}
+  info.ip = sh("uci get network.lan.ipaddr 2>/dev/null")
+  info.mask = sh("uci get network.lan.netmask 2>/dev/null")
+  if info.mask == '' then info.mask = '255.255.255.0' end
+  info.mac = sh("cat /sys/class/net/br-lan/address 2>/dev/null")
+  info.mtu = sh("cat /sys/class/net/br-lan/mtu 2>/dev/null")
+  info.dhcpStart = sh("uci get dhcp.lan.start 2>/dev/null")
+  info.dhcpLimit = sh("uci get dhcp.lan.limit 2>/dev/null")
+  info.dhcpLease = sh("uci get dhcp.lan.leasetime 2>/dev/null")
+  return info
+end
+
+-- ==================== 读取：广域网 ====================
+local function getWaninfo()
+  local wans = {}
+  local wanIdx = 0
+  local function addWan(name, proto, ifname)
+    wanIdx = wanIdx + 1
+    local dev = (ifname ~= '' and ifname) or name
+    local w = { id = name, name = name, proto = proto or 'dhcp', ifname = dev,
+      ip = '', mask = '', gateway = '', mac = '', mtu = '', dns1 = '', dns2 = '',
+      status = '未连接', onlineTime = '' }
+    local inet = sh("ip -4 addr show dev " .. dev .. " 2>/dev/null | grep 'inet ' | head -1")
+    local ipPart, cidr = inet:match('inet (%d+%.%d+%.%d+%.%d+)/(%d+)')
+    w.ip = ipPart or ''
+    w.mask = cidr and cidrToMask(cidr) or ''
+    w.mac = sh("cat /sys/class/net/" .. dev .. "/address 2>/dev/null")
+    w.mtu = sh("cat /sys/class/net/" .. dev .. "/mtu 2>/dev/null")
+    w.gateway = sh("ip route show default 2>/dev/null | grep -E 'dev " .. dev .. "' | awk '{print $3}' | head -1")
+    if w.gateway == '' then w.gateway = sh("uci get network." .. name .. ".gateway 2>/dev/null") end
+    local dnsAll = sh("uci get network." .. name .. ".dns 2>/dev/null")
+    w.dns1 = dnsAll:match('([^ %s]+)') or ''
+    w.dns2 = (dnsAll:match('[^ %s]+ ([^ %s]+)')) or ''
+    local upCount = sh("ip link show dev " .. dev .. " 2>/dev/null | grep -c 'state UP'")
+    if w.ip ~= '' and upCount == '1' then w.status = '在线'
+    elseif ifname == '' then w.status = '未配置'
+    else w.status = '未连接' end
+    wans[#wans + 1] = w
+  end
+  local curName, curProto, curIf = '', '', ''
+  for line in sh("uci show network"):gmatch('[^\n]+') do
+    local n = line:match('^network%.([%w_]+)%=')
+    if n then
+      if curName ~= '' and curName:match('^wan') and curProto ~= 'dhcpv6' and curProto ~= '6in4' then
+        addWan(curName, curProto, curIf)
+      end
+      curName, curProto, curIf = n, '', ''
+    end
+    local nm, pv = line:match('^network%.([%w_]+)%.proto=%s*[\'"]?([%w_]+)[\'"]?$')
+    if nm and nm == curName then curProto = pv end
+    local ni, iv = line:match('^network%.([%w_]+)%.ifname=%s*[\'"]?([%w_%.%-]+)[\'"]?$')
+    if ni and ni == curName then curIf = iv end
+  end
+  if curName ~= '' and curName:match('^wan') and curProto ~= 'dhcpv6' and curProto ~= '6in4' then
+    addWan(curName, curProto, curIf)
+  end
+  if #wans == 0 then addWan('wan', 'dhcp', 'eth1') end
+  return wans
+end
+
+-- ==================== 读取：主机 / ARP / 绑定 ====================
+local function getHosts()
+  local hosts = {}
+  local f = io.open('/tmp/dhcp.leases', 'r')
+  if f then
+    for line in f:lines() do
+      local expires, mac, ip, name, client = line:match('^(%d+)%s+([%w:]+)%s+([%d%.]+)%s+([%w_%-]*)%s*(.*)$')
+      if ip then
+        local remain = (tonumber(expires) or 0) - (os.time() or 0)
+        hosts[#hosts + 1] = { ip = ip, mac = mac or '', name = (name ~= '') and name or '(未命名)',
+          client = client or '', status = (remain >= 0) and '在线' or '离线' }
+      end
+    end
+    f:close()
+  end
+  return hosts
+end
+local function getArpList()
+  local list = {}
+  local f = io.open('/proc/net/arp', 'r')
+  if f then
+    local first = true
+    for line in f:lines() do
+      if first then first = false end
+      local ip, hw, flags, mac, dev = line:match('^([%d%.]+)%s+([%x]+)%s+([%x]+)%s+([%w:]+)%s+([%w]+)')
+      if ip and mac and mac ~= '00:00:00:00:00:00' then
+        list[#list + 1] = { ip = ip, mac = mac, interface = dev or '',
+          type = (flags == '6') and '静态' or '动态', status = '在线' }
+      end
+    end
+    f:close()
+  end
+  return list
+end
+local function getBindings()
+  local list = {}
+  local f = io.open('/etc/ethers', 'r')
+  if f then
+    for line in f:lines() do
+      local mac, ip = line:match('^([%w:]+)%s+([%d%.]+)')
+      if mac and ip then list[#list + 1] = { mac = mac, ip = ip } end
+    end
+    f:close()
+  end
+  return list
+end
+
+local function getLogs(limit)
+  limit = tonumber(limit) or 30
+  local logs = {}
+  local out = sh("logread -l " .. limit)
+  for line in out:gmatch('[^\n]+') do
+    local t, tag, content = line:match('^%a+ %a+ %d+ (%d+:%d+:%d+) %d+ ([%a%.]+) (.*)$')
+    if content then
+      logs[#logs + 1] = { time = t or '', type = tag or '', content = content, source = '' }
+    else
+      logs[#logs + 1] = { time = '', type = '', content = line, source = '' }
+    end
+  end
+  return logs
+end
+
+-- ==================== 读取：流量 / 连接 / 进程 ====================
+local function getTraffic()
+  local devs = {}
+  local f = io.open('/proc/net/dev', 'r')
+  if f then
+    local skip = 0
+    for line in f:lines() do
+      skip = skip + 1
+      if skip > 2 then
+        -- 格式: name: rx_bytes rx_packets ... tx_bytes tx_packets ...
+        local name, rx, rxp, tx, txp = line:match('^%s*([%w%.%-]+):%s+(%d+)%s+(%d+)%s+%d+%s+%d+%s+%d+%s+%d+%s+%d+%s+%d+%s+(%d+)%s+(%d+)')
+        if name then devs[#devs + 1] = { name = name, rxBytes = tonumber(rx) or 0, rxPackets = tonumber(rxp) or 0, txBytes = tonumber(tx) or 0, txPackets = tonumber(txp) or 0 } end
+      end
+    end
+    f:close()
+  end
+  return devs
+end
+local function getConns()
+  local stats = { total = 0, tcp = 0, udp = 0, icmp = 0, other = 0 }
+  local f = io.open('/proc/net/nf_conntrack', 'r')
+  if f then
+    for line in f:lines() do
+      stats.total = stats.total + 1
+      local proto = line:match('ipv4 2 (%w+)')
+      if proto == 'tcp' then stats.tcp = stats.tcp + 1
+      elseif proto == 'udp' then stats.udp = stats.udp + 1
+      elseif proto == 'icmp' then stats.icmp = stats.icmp + 1
+      else stats.other = stats.other + 1 end
+    end
+    f:close()
+  end
+  return stats
+end
+local function getProcesses()
+  local list = {}
+  local out = sh("ps -w | grep -v -E 'PID|grep' | head -40")
+  for line in out:gmatch('[^\n]+') do
+    local pid, cpu, mem, app = line:match('^%s*(%d+)%s+%d+%s+([%d%.]+)%s+([%d%.]+)%s+(.*)$')
+    if pid then list[#list + 1] = { pid = pid, cpu = cpu, mem = mem, app = app } end
+  end
+  return list
+end
+
+-- ==================== 读取：各类配置 ====================
+local function getDdns()
+  local records = {}
+  local out = sh("uci show ddns")
+  local i = 0
+  for line in out:gmatch('[^\n]+') do
+    local sid = line:match('^ddns%.([%w_]+)%.enabled=%s*[\'"]?([%w]+)[\'"]?$')
+    if sid and sid:match('^golden') then
+      i = i + 1
+      records[#records + 1] = {
+        id = i, wan = sh("uci get ddns." .. sid .. ".interface 2>/dev/null"),
+        provider = sh("uci get ddns." .. sid .. ".service_name 2>/dev/null"),
+        username = sh("uci get ddns." .. sid .. ".username 2>/dev/null"),
+        domain = sh("uci get ddns." .. sid .. ".domain 2>/dev/null"),
+        status = (sid and '已启用') or '未启用'
+      }
+    end
+  end
+  return records
+end
+local function getQos()
+  local info = { enable = false, down = '', up = '', dev = 'eth0', smin = 5, xmin = 10 }
+  local out = sh("uci show sqm 2>/dev/null")
+  for line in out:gmatch('[^\n]+') do
+    local s, v = line:match('^sqm%.([%w_]+)%.([%w_]+)=%s*[\'"]?([^\'"]*)[\'"]?$')
+    if s == 'eth0' or s == 'wan' or s == 'br-wan' then
+      if v == 'enabled' then info.enable = (line:find('"1"') or line:find("'1'")) ~= nil end
+      if v == 'download' then info.down = sh("uci get sqm." .. s .. ".download 2>/dev/null") end
+      if v == 'upload' then info.up = sh("uci get sqm." .. s .. ".upload 2>/dev/null") end
+    end
+  end
+  return info
+end
+local function getAccess()
+  local info = { httpPort = 80, remoteAccess = false, remotePort = 8080, adminUser = 'root', guestUser = 'guest', loginLock = 5, sessionTimeout = 15 }
+  local listen = sh("uci get uhttpd.main.listen_http 2>/dev/null")
+  local port = listen:match(':(%d+)$') or listen:match('^(%d+)$')
+  if port then info.httpPort = tonumber(port) end
+  local rlisten = sh("uci get uhttpd.main.listen_https 2>/dev/null")
+  if rlisten ~= '' then
+    info.remoteAccess = true
+    local rport = rlisten:match(':(%d+)$') or rlisten:match('^(%d+)$')
+    if rport then info.remotePort = tonumber(rport) end
+  else
+    local fwport = sh("uci get firewall.golden_remote.src_dport 2>/dev/null")
+    if fwport ~= '' then
+      info.remoteAccess = true
+      info.remotePort = tonumber(fwport) or 8080
+    end
+  end
+  info.adminUser = sh("uci get system.@system[0].golden_admin_user 2>/dev/null") ~= '' and sh("uci get system.@system[0].golden_admin_user 2>/dev/null") or 'root'
+  info.guestUser = sh("uci get system.@system[0].golden_guest_user 2>/dev/null") ~= '' and sh("uci get system.@system[0].golden_guest_user 2>/dev/null") or 'guest'
+  info.loginLock = tonumber(sh("uci get system.@system[0].golden_login_lock 2>/dev/null")) or 5
+  info.sessionTimeout = tonumber(sh("uci get system.@system[0].golden_session_timeout 2>/dev/null")) or 15
+  -- 远程访问白名单（uci 持久化；防火墙规则里的 src_ip 也可反推）
+  local allow = sh("uci get system.@system[0].golden_remote_allow 2>/dev/null")
+  if allow == '' then
+    local ips = {}
+    local firstIp = sh("uci get firewall.golden_remote.src_ip 2>/dev/null")
+    if firstIp ~= '' then ips[#ips + 1] = firstIp end
+    for i = 2, 20 do
+      local ip = sh("uci get firewall.golden_remote_" .. i .. ".src_ip 2>/dev/null")
+      if ip ~= '' then ips[#ips + 1] = ip else break end
+    end
+    allow = table.concat(ips, ',')
+  end
+  info.remoteAllow = allow
+  -- SSH 访问设置（dropbear）
+  local ssh = { enabled = false, localPort = 22, remoteAccess = false, remotePort = 2222, passwordAuth = true, authKey = '' }
+  local dropEnabled = sh("uci get dropbear.@dropbear[0].enable 2>/dev/null")
+  if dropEnabled == '' then dropEnabled = '1' end
+  ssh.enabled = (dropEnabled == '1')
+  local dropPort = sh("uci get dropbear.@dropbear[0].Port 2>/dev/null")
+  if dropPort ~= '' then ssh.localPort = tonumber(dropPort) or 22 end
+  local passAuth = sh("uci get dropbear.@dropbear[0].PasswordAuth 2>/dev/null")
+  if passAuth == '' then passAuth = 'on' end
+  ssh.passwordAuth = (passAuth == 'on' or passAuth == '1')
+  -- 远程访问：通过防火墙规则判断
+  local sshFwPort = sh("uci get firewall.golden_ssh_remote.src_dport 2>/dev/null")
+  if sshFwPort ~= '' then
+    ssh.remoteAccess = true
+    ssh.remotePort = tonumber(sshFwPort) or 2222
+  end
+  -- 认证密钥
+  local keyLines = {}
+  local f = io.open('/etc/dropbear/authorized_keys', 'r')
+  if f then
+    for line in f:lines() do if line ~= '' then keyLines[#keyLines + 1] = line end end
+    f:close()
+  end
+  ssh.authKey = table.concat(keyLines, '\n')
+  info.ssh = ssh
+  return info
+end
+local function getAdmin()
+  local username = sh("uci get system.@system[0].golden_admin_user 2>/dev/null") ~= '' and sh("uci get system.@system[0].golden_admin_user 2>/dev/null") or 'root'
+  return { username = username }
+end
+local function getDhcp()
+  local info = { enabled = true, start = '192.168.1.100', ['end'] = '192.168.1.200', gateway = '192.168.1.1', dns1 = '', dns2 = '', lease = 86400 }
+  local ignore = sh("uci get dhcp.lan.ignore 2>/dev/null")
+  info.enabled = (ignore ~= '1')
+  local startAddr = tonumber(sh("uci get dhcp.lan.start 2>/dev/null")) or 100
+  local limit = tonumber(sh("uci get dhcp.lan.limit 2>/dev/null")) or 100
+  local lanIp = sh("uci get network.lan.ipaddr 2>/dev/null") or '192.168.1.1'
+  local prefix = lanIp:match('^(%d+%.%d+%.%d+%.)') or '192.168.1.'
+  info.start = prefix .. tostring(startAddr)
+  info['end'] = prefix .. tostring(startAddr + limit)
+  info.gateway = lanIp
+  local leasetime = sh("uci get dhcp.lan.leasetime 2>/dev/null") or '12h'
+  local h = leasetime:match('^(%d+)h$')
+  if h then info.lease = tonumber(h) * 3600 else info.lease = 86400 end
+  local dns = sh("uci get dhcp.lan.dhcp_option 2>/dev/null")
+  if dns ~= '' then
+    local opts = {}
+    for o in dns:gmatch("'([^']+)'") do opts[#opts + 1] = o end
+    if opts[1] then info.dns1 = opts[1]:match('3,(%S+)') or '' end
+    if opts[2] then info.dns2 = opts[2]:match('3,(%S+)') or '' end
+  end
+  return info
+end
+local function getLoginUsers()
+  local list = {}
+  local out = sh("who 2>/dev/null")
+  for line in out:gmatch('[^\n]+') do
+    local user, tty, time, from = line:match('^(%S+)%s+(%S+)%s+([%d%-]+ [%d:]+)%s*(%S*)')
+    if user then list[#list + 1] = { user = user, tty = tty, time = time, from = from or '' } end
+  end
+  return list
+end
+
+-- 域名特殊解析（dnsmasq address=/domain/ip）
+local DOMAIN_CFG = '/etc/dnsmasq.conf.d/golden-domains.conf'
+local function getDomainResolve()
+  local list = {}
+  local f = io.open(DOMAIN_CFG, 'r')
+  if f then
+    for line in f:lines() do
+      local dom, ip = line:match('^address=/([%w_%-%.]+)/([%d%.]+)$')
+      if dom and ip then list[#list + 1] = { domain = dom, ip = ip } end
+    end
+    f:close()
+  end
+  return list
+end
+local function saveDomainResolve(cfg)
+  local list = cfg
+  if type(list) ~= 'table' then list = {} end
+  if list.records and type(list.records) == 'table' then list = list.records end
+  os.execute('mkdir -p /etc/dnsmasq.conf.d')
+  local f = io.open(DOMAIN_CFG, 'w')
+  local count = 0
+  for _, r in ipairs(list) do
+    local dom = tostring(r.domain or ''):gsub('^%s+', ''):gsub('%s+$', ''):gsub('/+$', '')
+    local ip = tostring(r.ip or ''):gsub('^%s+', ''):gsub('%s+$', '')
+    if dom ~= '' and ip:match(IPPAT) then
+      f:write('address=/' .. dom .. '/' .. ip .. '\n')
+      count = count + 1
+    end
+  end
+  f:close()
+  -- 确保 dnsmasq 加载 conf.d 目录
+  os.execute("uci -q delete dhcp.@dnsmasq[0].confdir")
+  os.execute("uci add_list dhcp.@dnsmasq[0].confdir='/tmp/dnsmasq.d'")
+  os.execute("uci add_list dhcp.@dnsmasq[0].confdir='/etc/dnsmasq.conf.d'")
+  uciCommit('dhcp')
+  os.execute('/etc/init.d/dnsmasq restart 2>/dev/null &')
+  return { saved = count }
+end
+
+-- ==================== 批2：速度限制 / 连接限制 / DDOS / 私接DHCP ====================
+
+local function ip2num(s)
+  local a, b, c, d = s:match('^(%d+)%.(%d+)%.(%d+)%.(%d+)$')
+  if not a then return nil end
+  return tonumber(a) * 16777216 + tonumber(b) * 65536 + tonumber(c) * 256 + tonumber(d)
+end
+local function num2ip(n)
+  n = math.floor(n)
+  local a = math.floor(n / 16777216) % 256
+  local b = math.floor(n / 65536) % 256
+  local c = math.floor(n / 256) % 256
+  local d = n % 256
+  return a .. '.' .. b .. '.' .. c .. '.' .. d
+end
+-- 宽松清洗：中文保留，仅去 shell 危险字符
+local function clean(s)
+  s = tostring(s or '')
+  return (s:gsub("[';`$|&<>]", ''):gsub('[\r\n]', ''))
+end
+-- 解析主机范围字符串 → {rstart, rend}（支持 单IP / IP-IP / IP-N / CIDR）
+local function parseRange(str)
+  local s = tostring(str or ''):gsub('%s+', '')
+  local res = { rstart = '', rend = '' }
+  if s == '' then return res end
+  local a, b = s:match('^(%d+%.%d+%.%d+%.%d+)%-(%d+%.%d+%.%d+%.%d+)$')
+  if not a then a, b = s:match('^(%d+%.%d+%.%d+%.%d+)%-(%d+)$') end
+  if a then
+    res.rstart = a
+    if b:match('^%d+$') then
+      local p1, p2, p3 = a:match('^(%d+)%.(%d+)%.(%d+)')
+      res.rend = p1 .. '.' .. p2 .. '.' .. p3 .. '.' .. b
+    else
+      res.rend = b
+    end
+    return res
+  end
+  local ip, cidr = s:match('^(%d+%.%d+%.%d+%.%d+)/(%d+)$')
+  if ip and tonumber(cidr) then
+    local bits = math.min(32, math.max(0, tonumber(cidr)))
+    local n = ip2num(ip)
+    local count = 2 ^ (32 - bits)
+    local base = math.floor(n / count) * count
+    res.rstart = num2ip(base)
+    res.rend = num2ip(base + count - 1)
+    return res
+  end
+  if s:match(IPPAT) then
+    res.rstart = s
+    res.rend = s
+  end
+  return res
+end
+-- 展开起止 IP 为列表（上限 254），single 模式使用
+local function expandRange(rstart, rend)
+  local s = ip2num(rstart)
+  local e = ip2num(rend)
+  if not s or not e then return nil end
+  if s > e then s, e = e, s end
+  if e - s > 254 then return nil end
+  local ips = {}
+  for i = s, e do ips[#ips + 1] = num2ip(i) end
+  return ips
+end
+-- WAN 显示名 → 设备名（WAN1→wan 接口 ifname，vpn 接口原样）
+local function wanDev(name)
+  local map = { WAN1 = 'wan', WAN2 = 'wan2', WAN3 = 'wan3', WAN4 = 'wan4', vpn1 = 'vpn1', vpn2 = 'vpn2' }
+  local uc = map[tostring(name or '')]
+  if not uc then uc = tostring(name or ''):match('^[%w_]+$') and tostring(name) or '' end
+  if uc == '' then return '' end
+  local ifname = sh("uci -q get network." .. uc .. ".ifname")
+  if ifname ~= '' then return ifname end
+  return uc
+end
+local function listSections(prefix)
+  local out = {}
+  local s = sh("uci -q show golden | sed -n 's/^golden\\.\\(" .. prefix .. "[0-9]*\\).*/\\1/p' | sort -u")
+  for sec in s:gmatch('%S+') do out[#out + 1] = sec end
+  return out
+end
+
+-- ==================== 批3：域名过滤 / 应用限制 / 电信网通 / 端口触发 / 镜像 / ARP 防御 ====================
+
+-- 内置应用模板：应用类型 → 端口特征集合（multiport 项，端口 或 起:止）
+local APP_PORTS = {
+  ['QQ'] = '8000,8080,443',
+  ['QQ直播'] = '8000,8080,1755,1935',
+  ['PPLive'] = '8008,8009,8900',
+  ['PPS(PPStream)'] = '8080,8500,8600',
+  ['flash视频'] = '80,8080,1935',
+  ['UUSee'] = '8080,9900,9911',
+  ['Qvod'] = '1863,8181,8686,8888',
+  ['酷狗音乐'] = '8000,8080,8888',
+  ['MSN'] = '1863,5190,6901',
+  ['飞信'] = '80,8080,443',
+  ['淘宝旺旺'] = '80,8080,443',
+  ['阿里旺旺'] = '80,8080,443',
+  ['ftp'] = '20,21',
+  ['http上传'] = '80,8080',
+  ['http多线程下载'] = '80,8080',
+  ['迅雷'] = '6881:6889,8000:9000,15000:16000',
+  ['超级旋风'] = '8000:9000,1863',
+  ['BitTorrent'] = '6881:6889',
+  ['eDonkey、eMule、Kad(EDK)'] = '4661:4672',
+  ['Vagaa'] = '4661:4672,8080',
+  ['http代理'] = '80,8080,3128,8088',
+  ['Socket4代理'] = '1080',
+  ['Socket5代理'] = '1080',
+  ['mute'] = '4000'
+}
+
+-- 地址库：key → 显示名（顺序即前端表格顺序）
+local IPLIB_ORDER = { 'ct', 'cnc', 'tietong', 'edu', 'custom1', 'custom2', 'custom3' }
+local IPLIB_KEYS = { ct = '电信', cnc = '网通', tietong = '铁通', edu = '教育网', custom1 = '自定义1', custom2 = '自定义2', custom3 = '自定义3' }
+-- 在线下载源（gaoyifan/china-operator-ip 的 ip-lite 精简表）
+local IPLIB_URL = {
+  ct = 'https://raw.githubusercontent.com/gaoyifan/china-operator-ip/ip-lite/telecom.txt',
+  cnc = 'https://raw.githubusercontent.com/gaoyifan/china-operator-ip/ip-lite/unicom.txt',
+  tietong = 'https://raw.githubusercontent.com/gaoyifan/china-operator-ip/ip-lite/mobile.txt'
+}
+-- 内置精简默认表（代表性网段，完整表请用「下载地址范围文件」）
+local DEFAULT_IPLIB = {
+  ct = { '219.128.0.0/12', '218.0.0.0/11', '202.96.0.0/12', '61.128.0.0/10', '116.0.0.0/12', '180.96.0.0/11', '27.0.0.0/10', '14.0.0.0/10', '112.0.0.0/10', '58.0.0.0/11' },
+  cnc = { '60.0.0.0/10', '123.0.0.0/11', '221.0.0.0/11', '202.106.0.0/16', '210.0.0.0/12', '61.48.0.0/13', '124.64.0.0/13', '58.32.0.0/12', '118.64.0.0/12', '124.192.0.0/13' },
+  tietong = { '101.0.0.0/12', '1.180.0.0/14', '42.0.0.0/10', '111.0.0.0/10', '117.0.0.0/12', '120.0.0.0/12', '122.0.0.0/12', '124.0.0.0/12', '113.0.0.0/12', '115.0.0.0/12' },
+  edu = { '202.112.0.0/13', '202.120.0.0/15', '202.122.0.0/15', '202.205.0.0/16', '202.206.0.0/15', '210.25.0.0/16', '210.26.0.0/15', '210.28.0.0/14', '210.32.0.0/14', '211.64.0.0/13' }
+}
+
+-- 校验 multiport 项：端口 或 起:止（如 3724-4000）
+local function portItemOk(p)
+  p = tostring(p or '')
+  return p:match('^%d+$') ~= nil or p:match('^%d+%-%d+$') ~= nil
+end
+-- 应用类型列表 → 端口集合字符串（去重，multiport 上限保守取 12 项）
+local function appsToPorts(apps)
+  local seen, out = {}, {}
+  local function add(it)
+    if not portItemOk(it) then return end
+    if not seen[it] then seen[it] = true; out[#out + 1] = it end
+  end
+  for _, name in ipairs(apps) do
+    local ports = APP_PORTS[tostring(name or '')]
+    if ports then
+      for it in ports:gmatch('[^,]+') do add(it) end
+    end
+  end
+  if #out > 12 then
+    local tmp = {}
+    for i = 1, 12 do tmp[i] = out[i] end
+    out = tmp
+  end
+  return table.concat(out, ',')
+end
+-- 写入地址库文件（仅接受合法 CIDR），返回写入条数
+local function writeIpLib(key, lines)
+  os.execute('mkdir -p /etc/golden/iplib')
+  local f = io.open('/etc/golden/iplib/' .. key .. '.txt', 'w')
+  local count = 0
+  if type(lines) == 'table' then
+    for _, ln in ipairs(lines) do
+      local cidr = tostring(ln or ''):gsub('%s+', ''):gsub('\r', '')
+      if cidr:match('^%d+%.%d+%.%d+%.%d+/%d+$') then
+        f:write(cidr .. '\n')
+        count = count + 1
+      end
+    end
+  end
+  f:close()
+  return count
+end
+
+-- ---- 域名过滤（dnsmasq 直接阻断） ----
+local function getDomainFilter()
+  local rules = {}
+  for _, sec in ipairs(listSections('domfilter_')) do
+    rules[#rules + 1] = { id = tonumber(sec:match('(%d+)$')) or 0, domain = sh("uci -q get golden." .. sec .. ".domain") }
+  end
+  local mode = sh("uci -q get golden.domainfilter.mode")
+  if mode == '' then mode = 'disable' end
+  return {
+    mode = mode,
+    rules = rules,
+    audit = (sh("uci -q get golden.domainfilter.audit") == '1'),
+    rebindProtect = (sh("uci -q get golden.domainfilter.rebind_protect") == '1')
+  }
+end
+local function saveDomainFilter(cfg)
+  cfg = cfg or {}
+  local mode = tostring(cfg.mode or 'disable')
+  if mode ~= 'disable' and mode ~= 'filter' and mode ~= 'allow' then mode = 'disable' end
+  local rules = cfg.rules
+  if type(rules) ~= 'table' then rules = {} end
+  for _, sec in ipairs(listSections('domfilter_')) do os.execute("uci -q delete golden." .. sec) end
+  local n = 0
+  for _, r in ipairs(rules) do
+    -- 规范化：去 *、空白、首尾点（google / *.sina.* / www.qq.com → 统一为 dnsmasq 后缀匹配）
+    local dom = tostring(r.domain or ''):gsub('%s+', ''):gsub('%*', '')
+    dom = dom:gsub('^%.+', ''):gsub('%.+$', '')
+    if dom ~= '' then
+      n = n + 1
+      uciSet('golden', 'domfilter_' .. n, 'domain', clean(dom))
+    end
+  end
+  uciSet('golden', 'domainfilter', 'mode', mode)
+  uciSet('golden', 'domainfilter', 'audit', (cfg.audit == true or cfg.audit == 1 or cfg.audit == '1') and '1' or '0')
+  uciSet('golden', 'domainfilter', 'rebind_protect', (cfg.rebindProtect == true or cfg.rebindProtect == 1 or cfg.rebindProtect == '1') and '1' or '0')
+  uciCommit('golden')
+  os.execute('sh /etc/golden/domainfilter.sh restart 2>/dev/null &')
+  os.execute('sh /etc/golden/dnsaudit.sh restart 2>/dev/null &')
+  return { saved = n, mode = mode }
+end
+
+-- 域名拦截审计日志（/tmp/golden_dnsblock.log，每行 时间|客户端IP|域名）
+local function getDnsBlockLogs(limit)
+  limit = limit or 50
+  local out = {}
+  local f = io.open('/tmp/golden_dnsblock.log', 'r')
+  if f then
+    local id = 0
+    for line in f:lines() do
+      local t, ip, dom = line:match('^([^|]+)|([^|]+)|(.*)$')
+      if t and ip and dom then
+        id = id + 1
+        out[#out + 1] = { id = id, time = t, ip = ip, domain = dom }
+      end
+    end
+    f:close()
+  end
+  if #out > limit then
+    local tmp = {}
+    for i = #out - limit + 1, #out do tmp[#tmp + 1] = out[i] end
+    out = tmp
+  end
+  return out
+end
+
+-- ---- 应用限制（iptables 端口+IP 特征） ----
+local function getAppLimit()
+  local rules = {}
+  for _, sec in ipairs(listSections('apprule_')) do
+    rules[#rules + 1] = {
+      id = tonumber(sec:match('(%d+)$')) or 0,
+      active = (sh("uci -q get golden." .. sec .. ".active") == '1'),
+      desc = sh("uci -q get golden." .. sec .. ".desc"),
+      range = sh("uci -q get golden." .. sec .. ".range"),
+      apps = {},
+      timeControl = (sh("uci -q get golden." .. sec .. ".timecontrol") == '1'),
+      timeSlots = sh("uci -q get golden." .. sec .. ".timeslots")
+    }
+    local a = sh("uci -q get golden." .. sec .. ".apps")
+    for x in a:gmatch('[^,]+') do rules[#rules].apps[#rules[#rules].apps + 1] = x end
+  end
+  return { templates = APP_PORTS, rules = rules }
+end
+local function saveAppLimit(cfg)
+  cfg = cfg or {}
+  local rules = cfg.rules
+  if type(rules) ~= 'table' then rules = {} end
+  for _, sec in ipairs(listSections('apprule_')) do os.execute("uci -q delete golden." .. sec) end
+  local n, applied = 0, 0
+  for _, r in ipairs(rules) do
+    local active = (r.active == true or r.active == 1 or r.active == '1')
+    local pr = parseRange(r.range or '')
+    if pr.rstart ~= '' then
+      local apps = r.apps
+      if type(apps) ~= 'table' then apps = {} end
+      local ports = appsToPorts(apps)
+      if ports ~= '' then
+        n = n + 1
+        local sec = 'apprule_' .. n
+        uciSet('golden', sec, 'active', active and '1' or '0')
+        uciSet('golden', sec, 'desc', clean(r.desc or ''))
+        uciSet('golden', sec, 'range', clean(r.range or ''))
+        uciSet('golden', sec, 'rstart', pr.rstart)
+        uciSet('golden', sec, 'rend', pr.rend)
+        uciSet('golden', sec, 'ports', ports)
+        uciSet('golden', sec, 'apps', table.concat(apps, ','))
+        uciSet('golden', sec, 'timecontrol', (r.timeControl == true or r.timeControl == 1 or r.timeControl == '1') and '1' or '0')
+        uciSet('golden', sec, 'timeslots', clean(r.timeSlots or ''))
+        if active then applied = applied + 1 end
+      end
+    end
+  end
+  uciSet('golden', 'applimit', 'enabled', applied > 0 and '1' or '0')
+  uciCommit('golden')
+  os.execute('sh /etc/golden/applimit.sh restart 2>/dev/null &')
+  return { saved = n, applied = applied }
+end
+
+-- ---- 电信网通地址库（ipset + 分流） ----
+local function getCtcnc()
+  local libs = {}
+  for _, key in ipairs(IPLIB_ORDER) do
+    local f = '/etc/golden/iplib/' .. key .. '.txt'
+    local count = tonumber(sh("wc -l < " .. f .. " 2>/dev/null") or '0') or 0
+    libs[#libs + 1] = {
+      key = key,
+      name = IPLIB_KEYS[key],
+      enabled = (sh("uci -q get golden.ctcnc_" .. key .. ".enabled") == '1'),
+      count = count,
+      file = (count > 0) and (key .. '.txt') or ''
+    }
+  end
+  return { libraries = libs }
+end
+local function saveCtcnc(cfg)
+  cfg = cfg or {}
+  local libs = cfg.libraries
+  if type(libs) == 'table' then
+    for _, lib in ipairs(libs) do
+      local key = tostring(lib.key or '')
+      if IPLIB_KEYS[key] then
+        uciSet('golden', 'ctcnc_' .. key, 'enabled', (lib.enabled == true or lib.enabled == 1 or lib.enabled == '1') and '1' or '0')
+      end
+    end
+  end
+  -- 可选：随配置提交导入网段（cfg.import = {key, lines[]}）
+  local imp = cfg.import
+  if type(imp) == 'table' and IPLIB_KEYS[tostring(imp.key or '')] then
+    local key = tostring(imp.key)
+    local count = writeIpLib(key, imp.lines)
+    uciSet('golden', 'ctcnc_' .. key, 'enabled', '1')
+    uciSet('golden', 'ctcnc_' .. key, 'count', count)
+  end
+  uciCommit('golden')
+  os.execute('sh /etc/golden/ctcnc.sh restart 2>/dev/null &')
+  return true
+end
+
+-- ---- 端口触发（ipset 记录 + 放行） ----
+local function getPortTrigger()
+  local rules = {}
+  for _, sec in ipairs(listSections('porttrigger_')) do
+    rules[#rules + 1] = {
+      id = tonumber(sec:match('(%d+)$')) or 0,
+      active = (sh("uci -q get golden." .. sec .. ".active") == '1'),
+      desc = sh("uci -q get golden." .. sec .. ".desc"),
+      protocol = sh("uci -q get golden." .. sec .. ".proto"),
+      triggerPort = sh("uci -q get golden." .. sec .. ".trigger"),
+      mapPort = sh("uci -q get golden." .. sec .. ".map")
+    }
+  end
+  return { rules = rules }
+end
+local function savePortTrigger(cfg)
+  cfg = cfg or {}
+  local rules = cfg.rules
+  if type(rules) ~= 'table' then rules = {} end
+  for _, sec in ipairs(listSections('porttrigger_')) do os.execute("uci -q delete golden." .. sec) end
+  local n, applied = 0, 0
+  for _, r in ipairs(rules) do
+    local active = (r.active == true or r.active == 1 or r.active == '1')
+    local proto = tostring(r.protocol or 'TCP'):gsub('%s+', '')
+    local pl = proto:lower()
+    if pl ~= 'tcp' and pl ~= 'udp' and pl ~= 'tcp+udp' then proto = 'TCP' else proto = pl end
+    local trigger = tostring(r.triggerPort or ''):gsub('%s+', '')
+    local map = tostring(r.mapPort or ''):gsub('%s+', '')
+    if trigger ~= '' and map ~= '' and portItemOk(trigger) and portItemOk(map) then
+      n = n + 1
+      local sec = 'porttrigger_' .. n
+      uciSet('golden', sec, 'active', active and '1' or '0')
+      uciSet('golden', sec, 'desc', clean(r.desc or ''))
+      uciSet('golden', sec, 'proto', proto)
+      uciSet('golden', sec, 'trigger', trigger)
+      uciSet('golden', sec, 'map', map)
+      if active then applied = applied + 1 end
+    end
+  end
+  uciSet('golden', 'porttrigger', 'enabled', applied > 0 and '1' or '0')
+  uciCommit('golden')
+  os.execute('sh /etc/golden/porttrigger.sh restart 2>/dev/null &')
+  return { saved = n, applied = applied }
+end
+
+-- ---- 镜像端口（tc mirred） ----
+local function getMirror()
+  return {
+    enabled = (sh("uci -q get golden.mirror.enabled") == '1'),
+    dir = sh("uci -q get golden.mirror.dir"),
+    mode = sh("uci -q get golden.mirror.mode"),
+    ip = sh("uci -q get golden.mirror.ip")
+  }
+end
+local function saveMirror(cfg)
+  cfg = cfg or {}
+  local dir = tostring(cfg.dir or 'all')
+  if dir ~= 'in' and dir ~= 'out' and dir ~= 'all' then dir = 'all' end
+  local mode = tostring(cfg.mode or 'host')
+  if mode ~= 'host' and mode ~= 'port' then mode = 'host' end
+  local ip = tostring(cfg.ip or ''):gsub('%s+', '')
+  uciSet('golden', 'mirror', 'enabled', (cfg.enabled == true or cfg.enabled == 1 or cfg.enabled == '1') and '1' or '0')
+  uciSet('golden', 'mirror', 'dir', dir)
+  uciSet('golden', 'mirror', 'mode', mode)
+  uciSet('golden', 'mirror', 'ip', ip)
+  uciCommit('golden')
+  os.execute('sh /etc/golden/mirror.sh restart 2>/dev/null &')
+  return true
+end
+
+-- ---- ARP 安全防御 ----
+local function getArpDefense()
+  return {
+    enabled = (sh("uci -q get golden.arpdefense.enabled") == '1'),
+    fakeGatewayEnabled = (sh("uci -q get golden.arpdefense.fakegateway") == '1'),
+    fakeGatewayInterval = tonumber(sh("uci -q get golden.arpdefense.fakeinterval")) or 200,
+    illegalGatewayEnabled = (sh("uci -q get golden.arpdefense.illegalgateway") == '1'),
+    illegalGatewayInterval = tonumber(sh("uci -q get golden.arpdefense.illegalinterval")) or 10,
+    analysisLevel = sh("uci -q get golden.arpdefense.level")
+  }
+end
+local function saveArpDefense(cfg)
+  cfg = cfg or {}
+  local fake = (cfg.fakeGatewayEnabled == true or cfg.fakeGatewayEnabled == 1 or cfg.fakeGatewayEnabled == '1')
+  local illegal = (cfg.illegalGatewayEnabled == true or cfg.illegalGatewayEnabled == 1 or cfg.illegalGatewayEnabled == '1')
+  local fi = tonumber(cfg.fakeGatewayInterval) or 200
+  local ii = tonumber(cfg.illegalGatewayInterval) or 10
+  if fi < 100 then fi = 100 end
+  if ii < 3 then ii = 3 end
+  local level = tostring(cfg.analysisLevel or '中')
+  if level ~= '高' and level ~= '中' and level ~= '低' then level = '中' end
+  uciSet('golden', 'arpdefense', 'enabled', (fake or illegal) and '1' or '0')
+  uciSet('golden', 'arpdefense', 'fakegateway', fake and '1' or '0')
+  uciSet('golden', 'arpdefense', 'fakeinterval', fi)
+  uciSet('golden', 'arpdefense', 'illegalgateway', illegal and '1' or '0')
+  uciSet('golden', 'arpdefense', 'illegalinterval', ii)
+  uciSet('golden', 'arpdefense', 'level', level)
+  uciCommit('golden')
+  os.execute('sh /etc/golden/arpdefense.sh restart 2>/dev/null &')
+  return true
+end
+-- ARP 防御日志（/tmp/golden_arplog，每行 时间|事件，取最近 limit 条）
+local function getArpLogs(limit)
+  limit = limit or 50
+  local out = {}
+  local f = io.open('/tmp/golden_arplog', 'r')
+  if f then
+    local id = 0
+    for line in f:lines() do
+      local t, ev = line:match('^([^|]+)|(.*)$')
+      if t and ev then
+        id = id + 1
+        out[#out + 1] = { id = id, time = t, event = ev }
+      end
+    end
+    f:close()
+  end
+  if #out > limit then
+    local tmp = {}
+    for i = #out - limit + 1, #out do tmp[#tmp + 1] = out[i] end
+    out = tmp
+  end
+  return out
+end
+
+-- ---- WAN 隐身 + 端口扫描检测（批4） ----
+local function getWanHarden()
+  return {
+    pingWan = (sh("uci -q get golden.wanharden.ping_wan") == '1'),
+    ttlDrop = (sh("uci -q get golden.wanharden.ttl_drop") == '1'),
+    scanEnable = (sh("uci -q get golden.wanharden.scan_enable") == '1'),
+    scanHitcount = tonumber(sh("uci -q get golden.wanharden.scan_hitcount")) or 30,
+    scanSeconds = tonumber(sh("uci -q get golden.wanharden.scan_seconds")) or 60
+  }
+end
+local function saveWanHarden(cfg)
+  cfg = cfg or {}
+  local pingWan = (cfg.pingWan == true or cfg.pingWan == 1 or cfg.pingWan == '1')
+  local ttlDrop = (cfg.ttlDrop == true or cfg.ttlDrop == 1 or cfg.ttlDrop == '1')
+  local scanEnable = (cfg.scanEnable == true or cfg.scanEnable == 1 or cfg.scanEnable == '1')
+  local hit = tonumber(cfg.scanHitcount) or 30
+  local sec = tonumber(cfg.scanSeconds) or 60
+  if hit < 5 then hit = 5 end
+  if hit > 500 then hit = 500 end
+  if sec < 10 then sec = 10 end
+  if sec > 3600 then sec = 3600 end
+  uciSet('golden', 'wanharden', 'ping_wan', pingWan and '1' or '0')
+  uciSet('golden', 'wanharden', 'ttl_drop', ttlDrop and '1' or '0')
+  uciSet('golden', 'wanharden', 'scan_enable', scanEnable and '1' or '0')
+  uciSet('golden', 'wanharden', 'scan_hitcount', hit)
+  uciSet('golden', 'wanharden', 'scan_seconds', sec)
+  uciCommit('golden')
+  os.execute('sh /etc/golden/wanharden.sh restart 2>/dev/null &')
+  return true
+end
+
+-- ---- 安全事件中心（批5）：聚合七类安全告警为统一事件模型 ----
+-- 事件源:
+--   /tmp/golden_arplog          ARP 防御（时间|事件）
+--   /tmp/golden_dnsblock.log    域名拦截审计（时间|IP|域名）
+--   /tmp/golden_dhcpdetect.log  私接 DHCP（时间|事件）
+--   logread GOLDEN-SCAN         端口扫描检测（内核 LOG，含 SRC= 源 IP）
+--   logread GOLDEN-DDOS         DDoS 并发超限（内核 LOG，ddos.sh 记录）
+--   logread GOLDEN-CONNLIMIT    连接限制超限（内核 LOG，connlimit.sh 记录）
+--   /tmp/golden_lock/<ip>       登录爆破封禁（失败计数文件，mtime=最后失败时间）
+local SEC_TYPES = {
+  arp       = { name = 'ARP 防御', level = 'medium' },
+  dnsblock  = { name = '域名拦截', level = 'low' },
+  dhcp      = { name = '私接 DHCP', level = 'high' },
+  scan      = { name = '端口扫描', level = 'high' },
+  ddos      = { name = 'DDoS 攻击', level = 'critical' },
+  connlimit = { name = '连接超限', level = 'medium' },
+  login     = { name = '登录爆破', level = 'high' }
+}
+local MONTHS = { Jan = 1, Feb = 2, Mar = 3, Apr = 4, May = 5, Jun = 6, Jul = 7, Aug = 8, Sep = 9, Oct = 10, Nov = 11, Dec = 12 }
+-- logread 行首时间 "Mon Aug 31 16:00:00 2026 ..." → 统一为 "2026-08-31 16:00:00"（可排序）
+local function logreadTime(line)
+  local mon, day, hms, year = line:match('^%S+ (%a+) (%d+) (%d+:%d+:%d+) (%d+) ')
+  local m = mon and MONTHS[mon]
+  if not m then return '' end
+  return string.format('%04d-%02d-%02d %s', tonumber(year), m, tonumber(day), hms)
+end
+local function logreadSrc(line)
+  return line:match('SRC=(%d+%.%d+%.%d+%.%d+)')
+end
+-- 读取文件末尾最多 max 行（保留最近事件，天然截断大文件）
+local function tailLines(path, max)
+  local out = {}
+  local f = io.open(path, 'r')
+  if f then
+    for line in f:lines() do
+      out[#out + 1] = line
+      if #out > max then table.remove(out, 1) end
+    end
+    f:close()
+  end
+  return out
+end
+-- 从 logread 提取指定前缀的内核告警行
+local function kernelEvents(prefix, max)
+  return sh("logread 2>/dev/null | grep '" .. prefix .. "' | tail -" .. max)
+end
+
+local function getSecEvents(limit, typeFilter)
+  limit = tonumber(limit) or 200
+  if limit < 1 then limit = 1 end
+  if limit > 1000 then limit = 1000 end
+  typeFilter = typeFilter or ''
+  local ev = {}
+  local function push(time, typ, src, desc)
+    local meta = SEC_TYPES[typ]
+    if not meta then return end
+    if typeFilter ~= '' and typ ~= typeFilter then return end
+    ev[#ev + 1] = {
+      time = (time and time ~= '' and time) or '-',
+      type = typ, typeName = meta.name, level = meta.level,
+      src = (src and src ~= '' and src) or '-', desc = desc or ''
+    }
+  end
+  -- 1) ARP 防御事件
+  for _, line in ipairs(tailLines('/tmp/golden_arplog', 300)) do
+    local t, desc = line:match('^([^|]+)|(.+)$')
+    if t then push(t, 'arp', desc:match('(%d+%.%d+%.%d+%.%d+)') or '', desc) end
+  end
+  -- 2) 域名拦截审计
+  for _, line in ipairs(tailLines('/tmp/golden_dnsblock.log', 2000)) do
+    local t, ip, dom = line:match('^([^|]+)|([^|]+)|(.*)$')
+    if t and dom and dom ~= '' then push(t, 'dnsblock', ip, '访问被拦截域名: ' .. dom) end
+  end
+  -- 3) 私接 DHCP 探测
+  for _, line in ipairs(tailLines('/tmp/golden_dhcpdetect.log', 500)) do
+    local t, desc = line:match('^([^|]+)|(.+)$')
+    if t then push(t, 'dhcp', desc:match('(%d+%.%d+%.%d+%.%d+)') or '', desc) end
+  end
+  -- 4) 端口扫描检测
+  for line in kernelEvents('GOLDEN-SCAN', 200):gmatch('[^\n]+') do
+    local dpt = line:match('DPT=(%d+)')
+    push(logreadTime(line), 'scan', logreadSrc(line),
+      '检测到端口扫描' .. (dpt and ('，目标端口 ' .. dpt) or '') .. '，来源已被拦截')
+  end
+  -- 5) DDoS 并发超限
+  for line in kernelEvents('GOLDEN-DDOS', 200):gmatch('[^\n]+') do
+    push(logreadTime(line), 'ddos', logreadSrc(line), '并发连接数超限，新连接已被丢弃')
+  end
+  -- 6) 连接限制超限
+  for line in kernelEvents('GOLDEN-CONNLIMIT', 200):gmatch('[^\n]+') do
+    push(logreadTime(line), 'connlimit', logreadSrc(line), '并发连接数超出限制，已重置/丢弃')
+  end
+  -- 7) 登录爆破封禁
+  local raw = sh('ls ' .. LOCK_DIR .. ' 2>/dev/null')
+  for ip in raw:gmatch('%d+%.%d+%.%d+%.%d+') do
+    local n = failCount(ip)
+    local mt = failTime(ip)  -- busybox 无 stat applet，改读锁文件第 2 行时间戳
+    push(os.date('%Y-%m-%d %H:%M:%S', mt > 0 and mt or os.time()), 'login', ip, '登录失败 ' .. n .. ' 次，已触发 IP 封禁')
+  end
+  -- 按时间倒序（最新在前）
+  table.sort(ev, function(a, b) return a.time > b.time end)
+  local out = {}
+  for i = 1, math.min(limit, #ev) do out[#out + 1] = ev[i] end
+  return { events = out }
+end
+
+-- 一键封禁黑名单：UCI golden.blocklist.ip 持久化 + iptables golden_block 链执行
+local function getBlockList()
+  local banned, seen = {}, {}
+  local raw = sh('uci -q get golden.blocklist.ip 2>/dev/null')
+  for ip in raw:gmatch('%d+%.%d+%.%d+%.%d+') do
+    if not seen[ip] then seen[ip] = true; banned[#banned + 1] = ip end
+  end
+  return { banned = banned }
+end
+-- block=true 封禁（建链+加规则+挂 FORWARD/INPUT，幂等）；false 解封
+local function applyBlockIp(ip, block)
+  if block then
+    os.execute('iptables -N golden_block 2>/dev/null; '
+      .. 'iptables -C golden_block -s ' .. ip .. ' -j DROP 2>/dev/null || iptables -A golden_block -s ' .. ip .. ' -j DROP 2>/dev/null; '
+      .. 'iptables -C FORWARD -j golden_block 2>/dev/null || iptables -I FORWARD -j golden_block 2>/dev/null; '
+      .. 'iptables -C INPUT -j golden_block 2>/dev/null || iptables -I INPUT -j golden_block 2>/dev/null')
+  else
+    os.execute('iptables -D golden_block -s ' .. ip .. ' -j DROP 2>/dev/null')
+  end
+end
+
+-- ---- 上网行为审计（批5）：全量 DNS 查询历史 ----
+-- 数据源 /tmp/golden_dnsaudit.log（时间|客户端IP|域名），dnsaudit.sh 守护写入
+local function getDnsAudit(ip, limit)
+  limit = tonumber(limit) or 200
+  if limit < 1 then limit = 1 end
+  if limit > 1000 then limit = 1000 end
+  ip = ip or ''
+  local out = {}
+  local lines = tailLines('/tmp/golden_dnsaudit.log', 5000)
+  for i = #lines, 1, -1 do
+    local t, lip, dom = lines[i]:match('^([^|]+)|([^|]+)|(.*)$')
+    if t and dom and dom ~= '' and (ip == '' or lip == ip) then
+      out[#out + 1] = { time = t, ip = lip, domain = dom }
+      if #out >= limit then break end
+    end
+  end
+  return { logs = out }
+end
+local function saveDnsAudit(cfg)
+  cfg = cfg or {}
+  local enabled = (cfg.enabled == true or cfg.enabled == 1 or cfg.enabled == '1')
+  uciSet('golden', 'dnsaudit', 'enabled', enabled and '1' or '0')
+  uciCommit('golden')
+  os.execute('sh /etc/golden/dnsaudit.sh restart 2>/dev/null &')
+  return true
+end
+
+-- ---- 速度限制 ----
+local function getSpeedLimit()
+  local rules = {}
+  for _, sec in ipairs(listSections('speedrule_')) do
+    rules[#rules + 1] = {
+      id = tonumber(sec:match('(%d+)$')) or 0,
+      active = (sh("uci -q get golden." .. sec .. ".active") == '1'),
+      desc = sh("uci -q get golden." .. sec .. ".desc"),
+      mode = sh("uci -q get golden." .. sec .. ".mode"),
+      up = tonumber(sh("uci -q get golden." .. sec .. ".up")) or 0,
+      down = tonumber(sh("uci -q get golden." .. sec .. ".down")) or 0,
+      wans = {},
+      range = sh("uci -q get golden." .. sec .. ".range"),
+      timeControl = (sh("uci -q get golden." .. sec .. ".timecontrol") == '1'),
+      timeSlots = sh("uci -q get golden." .. sec .. ".timeslots")
+    }
+    local w = sh("uci -q get golden." .. sec .. ".wans")
+    for wn in w:gmatch('[^,]+') do rules[#rules].wans[#rules[#rules].wans + 1] = wn end
+  end
+  return rules
+end
+local function saveSpeedLimit(cfg)
+  local rules = cfg
+  if type(rules) ~= 'table' then rules = {} end
+  if rules.rules and type(rules.rules) == 'table' then rules = rules.rules end
+  os.execute("uci -q delete golden.speedlimit")
+  for _, sec in ipairs(listSections('speedrule_')) do os.execute("uci -q delete golden." .. sec) end
+  local n, applied = 0, 0
+  for _, r in ipairs(rules) do
+    local active = (r.active == true or r.active == 1 or r.active == '1')
+    local mode = tostring(r.mode or 'share')
+    if mode ~= 'share' and mode ~= 'single' then mode = 'share' end
+    local up = tonumber(r.up) or 0
+    local down = tonumber(r.down) or 0
+    if up < 0 then up = 0 end
+    if down < 0 then down = 0 end
+    local pr = parseRange(r.range or '')
+    if pr.rstart ~= '' then
+      local ips = nil
+      if mode == 'single' then ips = expandRange(pr.rstart, pr.rend) end
+      if mode ~= 'single' or ips then
+        local wans = r.wans
+        if type(wans) ~= 'table' or #wans == 0 then wans = { 'WAN1' } end
+        for _, wn in ipairs(wans) do
+          local dev = wanDev(wn)
+          if dev ~= '' then
+            n = n + 1
+            local sec = 'speedrule_' .. n
+            uciSet('golden', sec, 'active', active and '1' or '0')
+            uciSet('golden', sec, 'desc', clean(r.desc or ''))
+            uciSet('golden', sec, 'mode', mode)
+            uciSet('golden', sec, 'dev', dev)
+            uciSet('golden', sec, 'up', up)
+            uciSet('golden', sec, 'down', down)
+            uciSet('golden', sec, 'range', clean(r.range or ''))
+            uciSet('golden', sec, 'wans', table.concat(wans, ','))
+            uciSet('golden', sec, 'timecontrol', (r.timeControl == true or r.timeControl == 1 or r.timeControl == '1') and '1' or '0')
+            uciSet('golden', sec, 'timeslots', clean(r.timeSlots or ''))
+            if mode == 'single' then
+              uciSet('golden', sec, 'ips', table.concat(ips, ','))
+            else
+              uciSet('golden', sec, 'rstart', pr.rstart)
+              uciSet('golden', sec, 'rend', pr.rend)
+            end
+            if active then applied = applied + 1 end
+          end
+        end
+      end
+    end
+  end
+  uciSet('golden', 'speedlimit', 'enabled', applied > 0 and '1' or '0')
+  uciCommit('golden')
+  os.execute('sh /etc/golden/speedlimit.sh restart 2>/dev/null &')
+  return { saved = n, applied = applied }
+end
+
+-- ---- 连接限制 ----
+local function getConnLimit()
+  local rules = {}
+  for _, sec in ipairs(listSections('connrule_')) do
+    rules[#rules + 1] = {
+      id = tonumber(sec:match('(%d+)$')) or 0,
+      active = (sh("uci -q get golden." .. sec .. ".active") == '1'),
+      desc = sh("uci -q get golden." .. sec .. ".desc"),
+      range = sh("uci -q get golden." .. sec .. ".range"),
+      limit = tonumber(sh("uci -q get golden." .. sec .. ".limit")) or 0,
+      timeControl = (sh("uci -q get golden." .. sec .. ".timecontrol") == '1'),
+      timeSlots = sh("uci -q get golden." .. sec .. ".timeslots")
+    }
+  end
+  return {
+    defaultConnLimit = tonumber(sh("uci -q get golden.connlimit.default_limit")) or 0,
+    rules = rules
+  }
+end
+local function saveConnLimit(cfg)
+  local defaultLimit = tonumber(cfg.defaultConnLimit) or 0
+  if defaultLimit < 0 then defaultLimit = 0 end
+  local rules = cfg.rules
+  if type(rules) ~= 'table' then rules = {} end
+  for _, sec in ipairs(listSections('connrule_')) do os.execute("uci -q delete golden." .. sec) end
+  local n = 0
+  for _, r in ipairs(rules) do
+    local active = (r.active == true or r.active == 1 or r.active == '1')
+    local pr = parseRange(r.range or '')
+    local limit = tonumber(r.limit) or 0
+    if pr.rstart ~= '' and limit > 0 then
+      n = n + 1
+      local sec = 'connrule_' .. n
+      uciSet('golden', sec, 'active', active and '1' or '0')
+      uciSet('golden', sec, 'desc', clean(r.desc or ''))
+      uciSet('golden', sec, 'range', clean(r.range or ''))
+      uciSet('golden', sec, 'rstart', pr.rstart)
+      uciSet('golden', sec, 'rend', pr.rend)
+      uciSet('golden', sec, 'limit', limit)
+      uciSet('golden', sec, 'timecontrol', (r.timeControl == true or r.timeControl == 1 or r.timeControl == '1') and '1' or '0')
+      uciSet('golden', sec, 'timeslots', clean(r.timeSlots or ''))
+    end
+  end
+  uciSet('golden', 'connlimit', 'default_limit', defaultLimit)
+  uciCommit('golden')
+  os.execute('sh /etc/golden/connlimit.sh restart 2>/dev/null &')
+  return { saved = n, defaultLimit = defaultLimit }
+end
+
+-- ---- DDOS 防御 ----
+local function getDdos()
+  local rules = {}
+  for _, sec in ipairs(listSections('ddosrule_')) do
+    rules[#rules + 1] = {
+      id = tonumber(sec:match('(%d+)$')) or 0,
+      active = (sh("uci -q get golden." .. sec .. ".active") == '1'),
+      desc = sh("uci -q get golden." .. sec .. ".desc"),
+      range = sh("uci -q get golden." .. sec .. ".range"),
+      concurrent = tonumber(sh("uci -q get golden." .. sec .. ".concurrent")) or 0,
+      interval = tonumber(sh("uci -q get golden." .. sec .. ".interval")) or 1,
+      timeControl = (sh("uci -q get golden." .. sec .. ".timecontrol") == '1'),
+      timeSlots = sh("uci -q get golden." .. sec .. ".timeslots")
+    }
+  end
+  return {
+    settings = {
+      defaultConcurrent = tonumber(sh("uci -q get golden.ddos.default_concurrent")) or 500,
+      defaultInterval = tonumber(sh("uci -q get golden.ddos.default_interval")) or 1
+    },
+    rules = rules
+  }
+end
+local function saveDdos(cfg)
+  local settings = cfg.settings
+  if type(settings) ~= 'table' then settings = {} end
+  local dc = tonumber(settings.defaultConcurrent) or 500
+  local di = tonumber(settings.defaultInterval) or 1
+  if dc < 0 then dc = 500 end
+  if di < 1 then di = 1 end
+  local rules = cfg.rules
+  if type(rules) ~= 'table' then rules = {} end
+  for _, sec in ipairs(listSections('ddosrule_')) do os.execute("uci -q delete golden." .. sec) end
+  local n = 0
+  for _, r in ipairs(rules) do
+    local active = (r.active == true or r.active == 1 or r.active == '1')
+    local pr = parseRange(r.range or '')
+    local cc = tonumber(r.concurrent) or 0
+    if pr.rstart ~= '' and cc > 0 then
+      n = n + 1
+      local sec = 'ddosrule_' .. n
+      uciSet('golden', sec, 'active', active and '1' or '0')
+      uciSet('golden', sec, 'desc', clean(r.desc or ''))
+      uciSet('golden', sec, 'range', clean(r.range or ''))
+      uciSet('golden', sec, 'rstart', pr.rstart)
+      uciSet('golden', sec, 'rend', pr.rend)
+      uciSet('golden', sec, 'concurrent', cc)
+      uciSet('golden', sec, 'interval', tonumber(r.interval) or 1)
+      uciSet('golden', sec, 'timecontrol', (r.timeControl == true or r.timeControl == 1 or r.timeControl == '1') and '1' or '0')
+      uciSet('golden', sec, 'timeslots', clean(r.timeSlots or ''))
+    end
+  end
+  uciSet('golden', 'ddos', 'default_concurrent', dc)
+  uciSet('golden', 'ddos', 'default_interval', di)
+  uciCommit('golden')
+  os.execute('sh /etc/golden/ddos.sh restart 2>/dev/null &')
+  return { saved = n, defaultConcurrent = dc }
+end
+
+-- ---- 私接 DHCP 探测 ----
+local function getDhcpDetect()
+  return {
+    interval = tonumber(sh("uci -q get golden.dhcpdetect.interval")) or 30,
+    intercept = (sh("uci -q get golden.dhcpdetect.intercept") == '1'),
+    alert = sh("uci -q get golden.dhcpdetect.alert")
+  }
+end
+local function saveDhcpDetect(cfg)
+  local interval = tonumber(cfg.interval) or 30
+  if interval < 5 then interval = 5 end
+  if interval > 3600 then interval = 3600 end
+  uciSet('golden', 'dhcpdetect', 'interval', interval)
+  uciSet('golden', 'dhcpdetect', 'intercept', (cfg.intercept == true or cfg.intercept == 1 or cfg.intercept == '1') and '1' or '0')
+  uciSet('golden', 'dhcpdetect', 'alert', clean(cfg.alert or '日志'))
+  uciCommit('golden')
+  os.execute('/etc/init.d/golden-dhcpdetect restart 2>/dev/null &')
+  return true
+end
+local function getDhcpDetectLogs(limit)
+  limit = tonumber(limit) or 50
+  local out = {}
+  local f = io.open('/tmp/golden_dhcpdetect.log', 'r')
+  if f then
+    local lines = {}
+    for line in f:lines() do lines[#lines + 1] = line end
+    f:close()
+    local start = math.max(1, #lines - limit + 1)
+    for i = start, #lines do
+      local t, ev = lines[i]:match('^([^|]+)|(.+)$')
+      if t then out[#out + 1] = { time = t, event = ev } end
+    end
+  end
+  return out
+end
+
+
+local function getLbStatus()
+  local lines = {}
+  local out = sh("mwan3 status 2>/dev/null")
+  for line in out:gmatch('[^\n]+') do
+    local iface, st = line:match('^Interface (%S+) .-online.%s*: (%a+)')
+    if iface then lines[#lines + 1] = { interface = iface, status = st } end
+  end
+  if #lines == 0 then
+    for _, w in ipairs(getWaninfo()) do
+      lines[#lines + 1] = { interface = w.id, status = w.status }
+    end
+  end
+  return lines
+end
+local function getUpnp()
+  local list = {}
+  local out = sh("upnpc -l 2>/dev/null | grep -E '^\\s*[0-9]+\\s' | head -20")
+  for line in out:gmatch('[^\n]+') do
+    local proto, ext, ip, int = line:match('^%s*(%d+)%s+(%a+)%s+([%d%.]+:%d+)%s+->%s+([%d%.]+:%d+)')
+    if proto then list[#list + 1] = { proto = proto, external = ext, internal = ip, target = int } end
+  end
+  return {
+    list = list,
+    enabled = (sh("uci -q get upnpd.config.enabled") == '1'),
+    secure = (sh("uci -q get upnpd.config.secure_mode") == '1')
+  }
+end
+
+-- ==================== 写入：网络 ====================
+local function saveWan(cfg)
+  local name = sanitize(cfg.id, '^[%w_]+$')
+  if name == '' then name = 'wan' end
+  local proto = sanitize(cfg.proto, '^[%w_]+$')
+  if proto == '' then proto = 'dhcp' end
+  uciSet('network', name, 'proto', proto)
+  uciSet('network', name, 'username', cfg.username)
+  uciSet('network', name, 'password', cfg.password)
+  uciSet('network', name, 'ipaddr', sanitize(cfg.ip, IPPAT))
+  uciSet('network', name, 'netmask', sanitize(cfg.mask, IPPAT))
+  uciSet('network', name, 'gateway', sanitize(cfg.gateway, IPPAT))
+  local dns = sanitize(cfg.dns1, '') .. ' ' .. sanitize(cfg.dns2, '')
+  uciSet('network', name, 'dns', dns:match('^%s*$') and nil or dns)
+  if cfg.mtu and tonumber(cfg.mtu) and tonumber(cfg.mtu) >= 576 then
+    uciSet('network', name, 'mtu', cfg.mtu)
+  end
+  if cfg.mac and cfg.mac:match(MACPAT) then uciSet('network', name, 'macaddr', cfg.mac) end
+  uciCommit('network')
+  os.execute('/etc/init.d/network reload 2>/dev/null &')
+  return true
+end
+local function saveLan(cfg)
+  if cfg.ip and cfg.ip:match(IPPAT) then uciSet('network', 'lan', 'ipaddr', cfg.ip) end
+  if cfg.mask and cfg.mask:match(IPPAT) then uciSet('network', 'lan', 'netmask', cfg.mask) end
+  uciCommit('network')
+  if cfg.dhcpStart and tonumber(cfg.dhcpStart) then uciSet('dhcp', 'lan', 'start', cfg.dhcpStart) end
+  if cfg.dhcpLimit and tonumber(cfg.dhcpLimit) then uciSet('dhcp', 'lan', 'limit', cfg.dhcpLimit) end
+  if cfg.dhcpLease then uciSet('dhcp', 'lan', 'leasetime', cfg.dhcpLease) end
+  uciCommit('dhcp')
+  os.execute('/etc/init.d/network reload 2>/dev/null & /etc/init.d/dnsmasq reload 2>/dev/null &')
+  return true
+end
+local function saveDhcp(cfg)
+  cfg = cfg or {}
+  local enabled = not (cfg.enabled == false or cfg.enabled == 'false' or cfg.enabled == 0 or cfg.enabled == '0')
+  uciSet('dhcp', 'lan', 'ignore', enabled and '0' or '1')
+  -- 从起止 IP 计算 start/limit
+  local startIp = cfg.start or '192.168.1.100'
+  local endIp = cfg['end'] or cfg.endIp or '192.168.1.200'
+  local lanIp = sh("uci get network.lan.ipaddr 2>/dev/null") or '192.168.1.1'
+  local prefix = lanIp:match('^(%d+%.%d+%.%d+%.)') or '192.168.1.'
+  local sNum = tonumber(startIp:match('^%d+%.%d+%.%d+%.(%d+)$')) or 100
+  local eNum = tonumber(endIp:match('^%d+%.%d+%.%d+%.(%d+)$')) or 200
+  uciSet('dhcp', 'lan', 'start', tostring(sNum))
+  uciSet('dhcp', 'lan', 'limit', tostring(math.max(1, eNum - sNum)))
+  if cfg.gateway and cfg.gateway:match(IPPAT) then
+    uciSet('dhcp', 'lan', 'dhcp_option', "'3," .. cfg.gateway .. "'")
+  end
+  if cfg.dns1 and cfg.dns1:match(IPPAT) then
+    local opt = cfg.dns2 and cfg.dns2:match(IPPAT) and
+      "'6," .. cfg.dns1 .. "," .. cfg.dns2 .. "'" or "'6," .. cfg.dns1 .. "'"
+    uciSet('dhcp', 'lan', 'dhcp_option', opt)
+  elseif cfg.dns2 and cfg.dns2:match(IPPAT) then
+    uciSet('dhcp', 'lan', 'dhcp_option', "'6," .. cfg.dns2 .. "'")
+  end
+  local lease = tonumber(cfg.lease) or 86400
+  local h = math.floor(lease / 3600)
+  uciSet('dhcp', 'lan', 'leasetime', h .. 'h')
+  uciCommit('dhcp')
+  os.execute('/etc/init.d/dnsmasq restart 2>/dev/null &')
+  return true
+end
+local function saveSystem(cfg)
+  if cfg.name then
+    uciSet('system', '@system[0]', 'hostname', sanitize(cfg.name, '^[%w_%-%s]+$'))
+    uciCommit('system')
+    os.execute('/etc/init.d/system reload 2>/dev/null &')
+  end
+  if cfg.time then os.execute("date -s '" .. sanitize(cfg.time, '^[%w%:%s%-]+$') .. "' 2>/dev/null") end
+  return true
+end
+
+-- ==================== 写入：QoS / 负载均衡 / 带宽叠加 ====================
+local function saveQos(cfg)
+  local dev = sanitize(cfg.dev or 'eth0', '^[%w%.%-]+$')
+  if dev == '' then dev = 'eth0' end
+  uciSet('sqm', dev, 'enabled', (cfg.enable and cfg.enable ~= false and cfg.enable ~= 'false' and cfg.enable ~= '0') and '1' or '0')
+  if cfg.down then uciSet('sqm', dev, 'download', cfg.down) end
+  if cfg.up then uciSet('sqm', dev, 'upload', cfg.up) end
+  uciSet('sqm', dev, 'interface', dev)
+  uciSet('sqm', dev, 'qdisc', 'fq_codel')
+  uciSet('sqm', dev, 'script', 'piece_of_cake.qos')
+  uciCommit('sqm')
+  os.execute('/etc/init.d/sqm restart 2>/dev/null &')
+  return true
+end
+local function saveLb(cfg)
+  -- 清理旧的 golden 配置
+  os.execute("uci delete mwan3.golden_policy 2>/dev/null; uci delete mwan3.golden_rule 2>/dev/null")
+  local members = {}
+  local mode = sanitize(cfg.mode or 'smart', '^[%w_]+$')
+  local lines = cfg.lines or {}
+  for i, line in ipairs(lines) do
+    local mn = 'golden_m' .. i
+    os.execute("uci delete mwan3." .. mn .. " 2>/dev/null")
+    uciSet('mwan3', mn, 'interface', sanitize(line.id, '^[%w_]+$'))
+    uciSet('mwan3', mn, 'weight', tonumber(line.weight) or 1)
+    local active = (line.active == true or line.active == '1' or line.active == 1)
+    if active then
+      uciSet('mwan3', mn, 'enabled', '1')
+      uciSet('mwan3', mn, 'track_ip', '223.5.5.5')
+      uciSet('mwan3', mn, 'interval', tonumber(line.interval) or 3)
+      uciSet('mwan3', mn, 'count', tonumber(line.times) or 3)
+      uciSet('mwan3', mn, 'timeout', '2')
+      uciSet('mwan3', mn, 'down', '2')
+      uciSet('mwan3', mn, 'up', '3')
+    else
+      uciSet('mwan3', mn, 'enabled', '0')
+    end
+    members[#members + 1] = mn
+  end
+  uciSet('mwan3', 'golden_policy', 'label', 'golden')
+  for _, mn in ipairs(members) do uciAddList('mwan3', 'golden_policy', 'use_member', mn) end
+  uciSet('mwan3', 'golden_rule', 'label', 'golden_all')
+  uciSet('mwan3', 'golden_rule', 'policy', 'golden_policy')
+  uciCommit('mwan3')
+  os.execute('/etc/init.d/mwan3 restart 2>/dev/null &')
+  return true
+end
+local function saveAgg(cfg)
+  -- 带宽叠加 = mwan3 balance 策略（同权值多线）
+  local lines = cfg.lines or {}
+  os.execute("uci delete mwan3.golden_agg_policy 2>/dev/null")
+  for i, line in ipairs(lines) do
+    local mn = 'golden_agg' .. i
+    os.execute("uci delete mwan3." .. mn .. " 2>/dev/null")
+    local active = (line.active == true or line.active == '1' or line.active == 1)
+    if active then
+      uciSet('mwan3', mn, 'interface', sanitize(line.id, '^[%w_]+$'))
+      uciSet('mwan3', mn, 'weight', tonumber(line.weight) or 1)
+      uciSet('mwan3', mn, 'enabled', '1')
+      uciSet('mwan3', mn, 'track_ip', '223.5.5.5')
+      uciSet('mwan3', mn, 'interval', '3')
+      uciSet('mwan3', mn, 'count', '3')
+      uciSet('mwan3', 'golden_agg_policy', 'label', 'golden_agg')
+      uciAddList('mwan3', 'golden_agg_policy', 'use_member', mn)
+    end
+  end
+  uciCommit('mwan3')
+  os.execute('/etc/init.d/mwan3 restart 2>/dev/null &')
+  return true
+end
+
+-- ==================== 写入：DDNS ====================
+local function saveDdns(cfg)
+  os.execute("uci delete ddns.golden 2>/dev/null")
+  local list = cfg
+  if type(list) ~= 'table' then list = cfg.records or {} end
+  for i, r in ipairs(list) do
+    local sn = 'golden_ddns' .. i
+    uciSet('ddns', sn, 'enabled', '1')
+    uciSet('ddns', sn, 'service_name', sanitize(r.provider or '3322.org', '^[%w_%-%.]+$'))
+    uciSet('ddns', sn, 'username', r.username or '')
+    uciSet('ddns', sn, 'password', r.password or '')
+    uciSet('ddns', sn, 'domain', sanitize(r.domain, '^[%w_%-%.]+$'))
+    uciSet('ddns', sn, 'interface', sanitize(r.wan or 'wan', '^[%w_]+$'))
+    uciSet('ddns', sn, 'use_ipv6', '0')
+  end
+  uciCommit('ddns')
+  os.execute('/etc/init.d/ddns restart 2>/dev/null &')
+  return true
+end
+
+-- ==================== 写入：防火墙 ====================
+local function saveFirewall(cfg)
+  cfg = cfg or {}
+  -- 连接数上限
+  if cfg.connMax and tonumber(cfg.connMax) then
+    os.execute("sysctl -w net.netfilter.nf_conntrack_max=" .. tonumber(cfg.connMax) .. " 2>/dev/null")
+  end
+  -- 端口映射（先清空 golden 规则）
+  os.execute("uci show firewall | grep -E 'firewall%.golden' | cut -d. -f2 | cut -d= -f1 | while read n; do uci delete firewall.$n; done 2>/dev/null")
+  local maps = cfg.portmaps or {}
+  for i, m in ipairs(maps) do
+    local rn = 'golden_rd' .. i
+    uciSet('firewall', rn, 'name', rn)
+    uciSet('firewall', rn, 'src', 'wan')
+    uciSet('firewall', rn, 'proto', 'tcp udp')
+    uciSet('firewall', rn, 'src_dport', sanitize(m.external, '^[%d%-]+$'))
+    uciSet('firewall', rn, 'dest_ip', sanitize(m.internalIp, IPPAT))
+    uciSet('firewall', rn, 'dest_port', sanitize(m.internal, '^[%d]+$'))
+    uciSet('firewall', rn, 'target', 'DNAT')
+    uciSet('firewall', rn, 'family', 'ipv4')
+  end
+  -- DMZ
+  if cfg.dmz and cfg.dmz.enable and cfg.dmz.ip and cfg.dmz.ip:match(IPPAT) then
+    uciSet('firewall', 'golden_dmz', 'name', 'golden_dmz')
+    uciSet('firewall', 'golden_dmz', 'src', 'wan')
+    uciSet('firewall', 'golden_dmz', 'dest_ip', cfg.dmz.ip)
+    uciSet('firewall', 'golden_dmz', 'target', 'DNAT')
+    uciSet('firewall', 'golden_dmz', 'family', 'ipv4')
+  else
+    os.execute("uci delete firewall.golden_dmz 2>/dev/null")
+  end
+  -- UPnP
+  if cfg.upnp ~= nil then
+    uciSet('upnpd', 'config', 'enabled', (cfg.upnp == true or cfg.upnp == '1' or cfg.upnp == 1) and '1' or '0')
+    uciCommit('upnpd')
+  end
+  -- UPnP 安全加固（批4）：secure_mode + 仅允许映射非特权端口（防内网恶意软件向公网开放 <1024 端口）
+  if cfg.upnpSecure ~= nil then
+    local sec = (cfg.upnpSecure == true or cfg.upnpSecure == '1' or cfg.upnpSecure == 1)
+    uciSet('upnpd', 'config', 'secure_mode', sec and '1' or '0')
+    os.execute("uci -q delete upnpd.config.acl_rule 2>/dev/null")
+    if sec then
+      os.execute("uci add_list upnpd.config.acl_rule='deny 0-1023 0.0.0.0/0 0-65535' 2>/dev/null")
+    end
+    uciCommit('upnpd')
+  end
+  uciCommit('firewall')
+  os.execute('/etc/init.d/firewall reload 2>/dev/null & /etc/init.d/miniupnpd restart 2>/dev/null &')
+  return true
+end
+
+-- ==================== 写入：ARP 绑定 / 行为管理 / 策略路由 / 高级 ====================
+local function saveArp(cfg)
+  local list = cfg
+  if type(list) ~= 'table' then list = {} end
+  local f = io.open('/etc/ethers', 'w')
+  for _, b in ipairs(list) do
+    if b.mac and b.mac:match(MACPAT) and b.ip and b.ip:match(IPPAT) then
+      f:write(b.mac .. '\t' .. b.ip .. '\n')
+    end
+  end
+  f:close()
+  os.execute("uci show dhcp | grep -E 'dhcp%.golden_lease' | cut -d. -f2 | cut -d= -f1 | while read n; do uci delete dhcp.$n; done 2>/dev/null")
+  for i, b in ipairs(list) do
+    if b.mac and b.mac:match(MACPAT) and b.ip and b.ip:match(IPPAT) then
+      uciSet('dhcp', 'golden_lease' .. i, 'mac', b.mac)
+      uciSet('dhcp', 'golden_lease' .. i, 'ip', b.ip)
+      uciSet('dhcp', 'golden_lease' .. i, 'name', b.name or '')
+    end
+  end
+  uciCommit('dhcp')
+  os.execute('/etc/init.d/dnsmasq reload 2>/dev/null &')
+  return true
+end
+local function saveBehavior(cfg)
+  cfg = cfg or {}
+  -- IP 段限制：防火墙 src 规则
+  os.execute("uci show firewall | grep -E 'firewall%.golden_ip' | cut -d. -f2 | cut -d= -f1 | while read n; do uci delete firewall.$n; done 2>/dev/null")
+  local rules = cfg.ipLimit or {}
+  local enable = (cfg.enable == true or cfg.enable == '1' or cfg.enable == 1)
+  if enable then
+    local i = 0
+    for _, r in ipairs(rules) do
+      if r.ip and (r.ip:match(IPPAT) or r.ip:find('*') or r.ip:find('-')) then
+        i = i + 1
+        local rn = 'golden_ip' .. i
+        uciSet('firewall', rn, 'name', rn)
+        uciSet('firewall', rn, 'src', 'lan')
+        uciSet('firewall', rn, 'src_ip', r.ip)
+        uciSet('firewall', rn, 'dest', 'wan')
+        uciSet('firewall', rn, 'proto', 'all')
+        uciSet('firewall', rn, 'target', 'REJECT')
+        uciSet('firewall', rn, 'family', 'ipv4')
+      end
+    end
+  end
+  uciCommit('firewall')
+  os.execute('/etc/init.d/firewall reload 2>/dev/null &')
+  return true
+end
+local function savePolicy(cfg)
+  -- 策略路由：写 mwan3 规则（目标 IP 走指定线路）
+  cfg = cfg or {}
+  os.execute("uci show mwan3 | grep -E 'mwan3%.golden_pr' | cut -d. -f2 | cut -d= -f1 | while read n; do uci delete mwan3.$n; done 2>/dev/null")
+  local routes = cfg.routes or {}
+  local i = 0
+  for _, r in ipairs(routes) do
+    if r.dest and r.interface then
+      i = i + 1
+      local rn = 'golden_pr' .. i
+      uciSet('mwan3', rn, 'label', rn)
+      uciSet('mwan3', rn, 'src_ip', r.src or '0.0.0.0/0')
+      uciSet('mwan3', rn, 'dest_ip', r.dest)
+      uciSet('mwan3', rn, 'proto', 'all')
+      -- mwan3 规则的正确字段是 use_policy（policy 是无效选项，写了会校验失败不生效）
+      uciSet('mwan3', rn, 'use_policy', r.interface)
+    end
+  end
+  uciCommit('mwan3')
+  os.execute('/etc/init.d/mwan3 restart 2>/dev/null &')
+  return true
+end
+local function setPassword(user, pass)
+  if not user or user == '' or not pass or pass == '' then return end
+  -- OpenWrt 使用 shadow 系统账户；root 是默认管理员。
+  -- 若用户名不是 root，则通过 uci 保存别名并在登录时做映射；
+  -- 这里先保证 root 密码被设置，再保存别名。
+  local safe = tostring(pass):gsub("'", "'\\''")
+  os.execute("(echo '" .. safe .. "'; echo '" .. safe .. "') | passwd root 2>/dev/null")
+  -- 同步应急通道：固件无 cryptpw 时 Web 校验依赖 golden_web_pass，改密后必须同步，否则新密码永远登录失败
+  uciSet('system', '@system[0]', 'golden_web_pass', tostring(pass))
+  uciCommit('system')
+  if user ~= 'root' then
+    uciSet('system', '@system[0]', 'golden_admin_user', user)
+    uciCommit('system')
+  end
+end
+
+-- 设置 guest（只读访客）密码；账户不存在（未初始化）时静默跳过
+local function setGuestPassword(pass)
+  if not pass or pass == '' then return end
+  local cnt = tonumber(sh("grep -c '^guest:' /etc/shadow 2>/dev/null") or '0') or 0
+  if cnt <= 0 then return end
+  local safe = tostring(pass):gsub("'", "'\\''")
+  os.execute("(echo '" .. safe .. "'; echo '" .. safe .. "') | passwd guest 2>/dev/null")
+end
+
+local function saveAdmin(cfg)
+  cfg = cfg or {}
+  local user = cfg.newUser or cfg.oldUser or 'root'
+  local pass = cfg.newPass
+  local confirm = cfg.newPassConfirm
+  if not pass or pass == '' then error('新密码不能为空') end
+  if pass ~= confirm then error('两次输入的新密码不一致') end
+  -- 用户名修改：保存别名；密码修改：写入 root（OpenWrt 实际管理账户）
+  setPassword(user, pass)
+  if cfg.newUser and cfg.newUser ~= '' then
+    uciSet('system', '@system[0]', 'golden_admin_user', cfg.newUser)
+    uciCommit('system')
+  end
+  return true
+end
+
+local function saveAdvanced(cfg)
+  cfg = cfg or {}
+  -- MAC 克隆
+  if cfg.macClone and cfg.macClone:match(MACPAT) then
+    uciSet('network', 'wan', 'macaddr', cfg.macClone)
+    uciCommit('network')
+    os.execute('/etc/init.d/network reload 2>/dev/null &')
+  end
+  -- Web 访问设置
+  if cfg.httpPort and tonumber(cfg.httpPort) then
+    uciSet('uhttpd', 'main', 'listen_http', '0.0.0.0:' .. tonumber(cfg.httpPort))
+  end
+  if cfg.remoteAccess then
+    if cfg.remotePort and tonumber(cfg.remotePort) then
+      -- 远程管理强制 HTTPS（绝不开放明文 HTTP 到 WAN）
+      uciSet('uhttpd', 'main', 'listen_https', '0.0.0.0:' .. tonumber(cfg.remotePort))
+      -- 清理旧的远程放通规则
+      os.execute("for i in $(seq 1 20); do uci -q delete firewall.golden_remote_$i 2>/dev/null; done")
+      -- 源 IP 白名单：留空 = 不创建任何放通规则 = 外网无法访问
+      local allow = (cfg.remoteAllow or ''):gsub('%s', '')
+      local n = 0
+      for ip in allow:gmatch('[^,]+') do
+        if ip:match('^[%d%.]+$') or ip:match('^[%d%.]+/[%d]+$') then
+          n = n + 1
+          local rn = (n == 1) and 'golden_remote' or ('golden_remote_' .. n)
+          uciSet('firewall', rn, 'name', rn)
+          uciSet('firewall', rn, 'src', 'wan')
+          uciSet('firewall', rn, 'proto', 'tcp')
+          uciSet('firewall', rn, 'src_ip', ip)
+          uciSet('firewall', rn, 'src_dport', tostring(cfg.remotePort))
+          uciSet('firewall', rn, 'target', 'ACCEPT')
+          uciSet('firewall', rn, 'family', 'ipv4')
+        end
+      end
+      if n == 0 then
+        os.execute("uci -q delete firewall.golden_remote 2>/dev/null")
+      end
+      uciSet('system', '@system[0]', 'golden_remote_allow', allow)
+      uciCommit('firewall')
+      uciCommit('system')
+      os.execute('/etc/init.d/firewall reload 2>/dev/null &')
+    end
+  else
+    os.execute("uci -q delete uhttpd.main.listen_https 2>/dev/null; uci -q delete firewall.golden_remote 2>/dev/null; for i in $(seq 1 20); do uci -q delete firewall.golden_remote_$i 2>/dev/null; done")
+    uciCommit('uhttpd')
+    uciCommit('firewall')
+    os.execute('/etc/init.d/firewall reload 2>/dev/null &')
+  end
+  if cfg.adminUser and cfg.adminUser ~= '' then
+    uciSet('system', '@system[0]', 'golden_admin_user', cfg.adminUser)
+  end
+  if cfg.guestUser and cfg.guestUser ~= '' then
+    uciSet('system', '@system[0]', 'golden_guest_user', cfg.guestUser)
+  end
+  if cfg.loginLock and tonumber(cfg.loginLock) then
+    uciSet('system', '@system[0]', 'golden_login_lock', tostring(cfg.loginLock))
+  end
+  if cfg.sessionTimeout and tonumber(cfg.sessionTimeout) then
+    uciSet('system', '@system[0]', 'golden_session_timeout', tostring(cfg.sessionTimeout))
+  end
+  if cfg.adminPass and cfg.adminPass ~= '' then
+    setPassword(cfg.adminUser or 'root', cfg.adminPass)
+    -- 首次登录强制改密完成后清除标志
+    uciSet('system', '@system[0]', 'golden_first_login', '0')
+    uciCommit('system')
+  end
+  if cfg.guestPass and cfg.guestPass ~= '' then
+    setGuestPassword(cfg.guestPass)
+  end
+  -- SSH 访问设置
+  local ssh = cfg.ssh
+  if type(ssh) == 'table' then
+    uciSet('dropbear', '@dropbear[0]', 'enable', ssh.enabled and '1' or '0')
+    if ssh.localPort and tonumber(ssh.localPort) then
+      uciSet('dropbear', '@dropbear[0]', 'Port', tostring(ssh.localPort))
+    end
+    uciSet('dropbear', '@dropbear[0]', 'PasswordAuth', (ssh.passwordAuth == false or ssh.passwordAuth == 'false' or ssh.passwordAuth == 0 or ssh.passwordAuth == '0') and 'off' or 'on')
+    uciCommit('dropbear')
+    -- 认证密钥写入 /etc/dropbear/authorized_keys
+    local keyText = ssh.authKey or ''
+    if keyText ~= '' then
+      os.execute("mkdir -p /etc/dropbear")
+      local kf = io.open('/etc/dropbear/authorized_keys', 'w')
+      if kf then
+        -- 关键：gsub 返回 (新串, 替换次数) 两个值，直接喂变参 file:write 会把计数数字追加进
+        -- authorized_keys 末尾（如 "...AAA==1"），dropbear 解析非法行会拒绝整把密钥登录。
+        -- 必须用括号只取第一个返回值（v1.1.3 同类多返回值事故，此修复补漏）。
+        kf:write((keyText:gsub('\r\n', '\n'):gsub('\r', '\n')))
+        kf:close()
+      end
+    else
+      os.execute("rm -f /etc/dropbear/authorized_keys")
+    end
+    -- 远程访问防火墙
+    if ssh.remoteAccess and ssh.remotePort and tonumber(ssh.remotePort) then
+      uciSet('firewall', 'golden_ssh_remote', 'name', 'golden_ssh_remote')
+      uciSet('firewall', 'golden_ssh_remote', 'src', 'wan')
+      uciSet('firewall', 'golden_ssh_remote', 'proto', 'tcp')
+      uciSet('firewall', 'golden_ssh_remote', 'src_dport', tostring(ssh.remotePort))
+      uciSet('firewall', 'golden_ssh_remote', 'dest_port', tostring(ssh.localPort or 22))
+      uciSet('firewall', 'golden_ssh_remote', 'target', 'ACCEPT')
+      uciSet('firewall', 'golden_ssh_remote', 'family', 'ipv4')
+      uciCommit('firewall')
+      os.execute('/etc/init.d/firewall reload 2>/dev/null &')
+    else
+      os.execute("uci delete firewall.golden_ssh_remote 2>/dev/null")
+      uciCommit('firewall')
+      os.execute('/etc/init.d/firewall reload 2>/dev/null &')
+    end
+    os.execute('/etc/init.d/dropbear restart 2>/dev/null &')
+  end
+  uciCommit('uhttpd')
+  uciCommit('system')
+  os.execute('/etc/init.d/uhttpd restart 2>/dev/null &')
+
+  -- 静态路由
+  local routes = cfg.staticRoutes or {}
+  for i, r in ipairs(routes) do
+    if r.target and r.gateway then
+      local rn = 'golden_sr' .. i
+      os.execute("uci delete network." .. rn .. " 2>/dev/null")
+      uciSet('network', rn, 'target', sanitize(r.target, '^[%d%.%/]+$'))
+      uciSet('network', rn, 'gateway', sanitize(r.gateway, IPPAT))
+      uciSet('network', rn, 'interface', sanitize(r.interface or 'lan', '^[%w_]+$'))
+      uciSet('network', rn, 'type', 'route')
+    end
+  end
+  uciCommit('network')
+  os.execute('/etc/init.d/network reload 2>/dev/null &')
+  return true
+end
+
+-- ==================== 批8：真实数据全量读写（覆盖补齐 53 页面数据契约） ====================
+
+-- UCI 接口 id → 前端显示名（wan→广域网1）
+local function wanNameOf(id)
+  id = tostring(id or '')
+  if id == 'wan' then return '广域网1' end
+  local n = id:match('^wan(%d)$')
+  if n then return '广域网' .. n end
+  return id
+end
+-- 前端显示名 → UCI 接口 id
+local function wanUcId(name)
+  local map = { ['广域网1'] = 'wan', ['广域网2'] = 'wan2', ['广域网3'] = 'wan3', ['广域网4'] = 'wan4', vpn1 = 'vpn1', vpn2 = 'vpn2' }
+  return map[tostring(name or '')] or tostring(name or '')
+end
+
+-- ---- 重写 saveQos：适配前端 qos 对象 { enabled, mode, wans[], exceptions{} } ----
+local function saveQos(cfg)
+  cfg = cfg or {}
+  local mode = sanitize(cfg.mode or 'smart', '^[%w_]+$')
+  if mode ~= '' then uciSet('golden', 'qos', 'mode', mode) end
+  local wans = cfg.wans
+  if type(wans) == 'table' then
+    for _, w in ipairs(wans) do
+      local dev = wanDev(w.name or '')
+      if dev ~= '' then
+        local up = tonumber(w.up) or 0
+        local down = tonumber(w.down) or 0
+        local on = (up > 0) or (down > 0)
+        local en = on and (cfg.enabled == true or cfg.enabled == '1' or cfg.enabled == 1)
+        uciSet('sqm', dev, 'enabled', en and '1' or '0')
+        if down > 0 then uciSet('sqm', dev, 'download', tostring(down)) end
+        if up > 0 then uciSet('sqm', dev, 'upload', tostring(up)) end
+        uciSet('sqm', dev, 'interface', dev)
+        uciSet('sqm', dev, 'qdisc', 'fq_codel')
+        uciSet('sqm', dev, 'script', 'piece_of_cake.qos')
+      end
+    end
+    uciCommit('sqm')
+  end
+  os.execute("uci -q delete golden.qos.ex_ip 2>/dev/null; uci -q delete golden.qos.ex_dom 2>/dev/null")
+  local ex = cfg.exceptions
+  if type(ex) == 'table' then
+    if type(ex.ip) == 'table' then
+      for _, e in ipairs(ex.ip) do
+        local v = sanitize(e.value or '', '^[%w%.:%*%-]+$')
+        if v ~= '' then uciAddList('golden', 'qos', 'ex_ip', v) end
+      end
+    end
+    if type(ex.domain) == 'table' then
+      for _, e in ipairs(ex.domain) do
+        local v = sanitize(e.value or '', '^[%w%.:%*%-]+$')
+        if v ~= '' then uciAddList('golden', 'qos', 'ex_dom', v) end
+      end
+    end
+  end
+  uciCommit('golden')
+  os.execute('/etc/init.d/sqm restart 2>/dev/null &')
+  return true
+end
+
+-- ---- 静态路由（独立域，写 network.golden_sr*） ----
+local function saveStaticRoutes(cfg)
+  cfg = cfg or {}
+  local routes = cfg.routes
+  if type(routes) ~= 'table' then routes = {} end
+  os.execute("uci show network | grep -E 'network%.golden_sr' | cut -d. -f2 | cut -d= -f1 | while read n; do uci delete network.$n; done 2>/dev/null")
+  for i, r in ipairs(routes) do
+    if r.dest and r.gateway then
+      local rn = 'golden_sr' .. i
+      uciSet('network', rn, 'target', sanitize(r.dest, '^[%d%.%/]+$'))
+      uciSet('network', rn, 'netmask', sanitize(r.mask or '', '^[%d%.]+$'))
+      uciSet('network', rn, 'gateway', sanitize(r.gateway, IPPAT))
+      uciSet('network', rn, 'metric', sanitize(r.metric or '0', '^[%d]+$'))
+      uciSet('network', rn, 'interface', sanitize(tostring(r.iface or 'lan'):lower(), '^[%w_]+$'))
+      uciSet('network', rn, 'type', 'route')
+    end
+  end
+  uciCommit('network')
+  os.execute('/etc/init.d/network reload 2>/dev/null &')
+  return true
+end
+
+-- ---- 域名重定向（golden.domredir_* + dnsmasq address 生效） ----
+local function saveDomainRedirect(cfg)
+  cfg = cfg or {}
+  local rules = cfg.rules
+  if type(rules) ~= 'table' then rules = {} end
+  for _, sec in ipairs(listSections('domredir_')) do os.execute("uci -q delete golden." .. sec) end
+  for i, r in ipairs(rules) do
+    local sec = 'domredir_' .. i
+    uciSet('golden', sec, 'active', (r.active == true or r.active == 1 or r.active == '1') and '1' or '0')
+    uciSet('golden', sec, 'log', (r.log == true or r.log == 1 or r.log == '1') and '1' or '0')
+    uciSet('golden', sec, 'desc', clean(r.desc or ''))
+    uciSet('golden', sec, 'urlhost', clean(r.urlHost or ''))
+    uciSet('golden', sec, 'targeturl', clean(r.targetUrl or ''))
+    uciSet('golden', sec, 'urlparam', clean(r.urlParam or ''))
+    uciSet('golden', sec, 'redirectto', clean(r.redirectTo or ''))
+    uciSet('golden', sec, 'appendurl', (r.appendUrl == true or r.appendUrl == 1 or r.appendUrl == '1') and '1' or '0')
+    uciSet('golden', sec, 'range', clean(r.range or ''))
+    uciSet('golden', sec, 'timecontrol', (r.timeControl == true or r.timeControl == 1 or r.timeControl == '1') and '1' or '0')
+    uciSet('golden', sec, 'timeslots', clean(r.timeSlots or ''))
+  end
+  uciCommit('golden')
+  -- 生效：写 dnsmasq address=/域名/重定向IP
+  os.execute("mkdir -p /tmp/dnsmasq.d && rm -f /tmp/dnsmasq.d/golden-redirect.conf")
+  local conf = io.open('/tmp/dnsmasq.d/golden-redirect.conf', 'w')
+  if conf then
+    for _, r in ipairs(rules) do
+      local active = (r.active == true or r.active == 1 or r.active == '1')
+      if active and r.urlHost and r.urlHost ~= '' and r.redirectTo and r.redirectTo ~= '' then
+        local host = tostring(r.urlHost):gsub('^%*%.', ''):gsub('%*', ''):gsub('%s+', '')
+        local to = sanitize(r.redirectTo, IPPAT)
+        if host ~= '' and to ~= '' then conf:write('address=/' .. host .. '/' .. to .. '\n') end
+      end
+    end
+    conf:close()
+    os.execute("/etc/init.d/dnsmasq restart 2>/dev/null &")
+  end
+  return true
+end
+
+-- ---- MAC 地址设置（network device mac） ----
+local function saveMacSettings(cfg)
+  cfg = cfg or {}
+  if cfg.lanMac and cfg.lanMac:match(MACPAT) then
+    uciSet('network', 'lan', 'macaddr', cfg.lanMac)
+  end
+  if type(cfg.wans) == 'table' then
+    for _, w in ipairs(cfg.wans) do
+      if w.name and w.current and w.current:match(MACPAT) then
+        local id = wanUcId(w.name)
+        if id ~= '' and id:match('^wan') then uciSet('network', id, 'macaddr', w.current) end
+      end
+    end
+  end
+  uciCommit('network')
+  os.execute('/etc/init.d/network reload 2>/dev/null &')
+  return true
+end
+
+-- ---- 行为管理-访问控制（golden.accessrule_*） ----
+local function saveAccessRules(cfg)
+  cfg = cfg or {}
+  local mode = sanitize(cfg.mode or 'disabled', '^[%w_]+$')
+  if mode ~= '' then uciSet('golden', 'access', 'mode', mode) end
+  local rules = cfg.rules
+  if type(rules) ~= 'table' then rules = {} end
+  for _, sec in ipairs(listSections('accessrule_')) do os.execute("uci -q delete golden." .. sec) end
+  for i, r in ipairs(rules) do
+    local sec = 'accessrule_' .. i
+    uciSet('golden', sec, 'active', (r.active == true or r.active == 1 or r.active == '1') and '1' or '0')
+    uciSet('golden', sec, 'log', (r.log == true or r.log == 1 or r.log == '1') and '1' or '0')
+    uciSet('golden', sec, 'desc', clean(r.desc or ''))
+    uciSet('golden', sec, 'action', clean(r.action or '禁止'))
+    uciSet('golden', sec, 'order', tonumber(r.order) or i)
+    uciSet('golden', sec, 'range', clean(r.range or ''))
+    uciSet('golden', sec, 'remoteip', clean(r.remoteIp or ''))
+    uciSet('golden', sec, 'remotedomain', clean(r.remoteDomain or ''))
+    uciSet('golden', sec, 'protocol', clean(r.protocol or ''))
+    uciSet('golden', sec, 'timecontrol', (r.timeControl == true or r.timeControl == 1 or r.timeControl == '1') and '1' or '0')
+    uciSet('golden', sec, 'timeslots', clean(r.timeSlots or ''))
+  end
+  uciCommit('golden')
+  os.execute('/etc/init.d/firewall reload 2>/dev/null &')
+  return true
+end
+
+-- ---- 带宽保证（golden.guarrule_*，配置持久化；tc 生效由 speedlimit.sh 聚合） ----
+local function saveBandwidthGuarantee(cfg)
+  cfg = cfg or {}
+  local rules = cfg.rules
+  if type(rules) ~= 'table' then rules = {} end
+  for _, sec in ipairs(listSections('guarrule_')) do os.execute("uci -q delete golden." .. sec) end
+  for i, r in ipairs(rules) do
+    local sec = 'guarrule_' .. i
+    uciSet('golden', sec, 'active', (r.active == true or r.active == 1 or r.active == '1') and '1' or '0')
+    uciSet('golden', sec, 'desc', clean(r.desc or ''))
+    uciSet('golden', sec, 'mode', clean(r.mode or 'exclusive'))
+    uciSet('golden', sec, 'range', clean(r.range or ''))
+    uciSet('golden', sec, 'up', tonumber(r.up) or 0)
+    uciSet('golden', sec, 'down', tonumber(r.down) or 0)
+    local wans = r.wans
+    if type(wans) ~= 'table' or #wans == 0 then wans = { 'WAN1' } end
+    uciSet('golden', sec, 'wans', table.concat(wans, ','))
+    uciSet('golden', sec, 'timecontrol', (r.timeControl == true or r.timeControl == 1 or r.timeControl == '1') and '1' or '0')
+    uciSet('golden', sec, 'timeslots', clean(r.timeSlots or ''))
+  end
+  uciCommit('golden')
+  os.execute('sh /etc/golden/speedlimit.sh restart 2>/dev/null &')
+  return true
+end
+
+-- ---- 读取：负载均衡（mwan3 golden_policy） ----
+local function getLoadBalance()
+  local lines = {}
+  local mem = sh("uci -q get mwan3.golden_policy.use_member")
+  for mn in mem:gmatch('%S+') do
+    local id = sh("uci -q get mwan3." .. mn .. ".interface")
+    lines[#lines + 1] = {
+      wan = wanNameOf(id),
+      joinDefault = (sh("uci -q get mwan3." .. mn .. ".enabled") == '1'),
+      weightType = 'reference',
+      weight = tonumber(sh("uci -q get mwan3." .. mn .. ".weight")) or 1,
+      detect = (sh("uci -q get mwan3." .. mn .. ".track_ip") ~= ''),
+      interval = tonumber(sh("uci -q get mwan3." .. mn .. ".interval")) or 10,
+      times = tonumber(sh("uci -q get mwan3." .. mn .. ".count")) or 5,
+      failAction = '仅记录到日志', noDetectDown = 0, detectGw = false, gwIp = '',
+      detectRemote = false, remoteAddr = 'www.baidu.com'
+    }
+  end
+  return { mode = 'ip', lines = lines }
+end
+
+-- ---- 读取：带宽叠加（mwan3 golden_agg_policy） ----
+local function getBandwidthAgg()
+  local lines = {}
+  local mem = sh("uci -q get mwan3.golden_agg_policy.use_member")
+  for mn in mem:gmatch('%S+') do
+    local id = sh("uci -q get mwan3." .. mn .. ".interface")
+    lines[#lines + 1] = {
+      wan = wanNameOf(id),
+      join = (sh("uci -q get mwan3." .. mn .. ".enabled") == '1'),
+      up = 0, down = 0,
+      weight = tonumber(sh("uci -q get mwan3." .. mn .. ".weight")) or 1
+    }
+  end
+  return { enabled = (#lines > 0), mode = 'smart', lines = lines }
+end
+
+-- ---- 读取：策略路由（mwan3 golden_pr*） ----
+local function getPolicyRoutes()
+  local routes = {}
+  local out = sh("uci show mwan3 | grep -E 'mwan3%.golden_pr%[0-9]+%.label'")
+  for line in out:gmatch('[^\n]+') do
+    local sec = line:match('^mwan3%.(golden_pr%d+)%.label')
+    if sec then
+      local pol = sh("uci -q get mwan3." .. sec .. ".use_policy")  -- 与 savePolicy 写入字段一致
+      routes[#routes + 1] = {
+        id = tonumber(sec:match('(%d+)$')) or 0,
+        active = true, log = false,
+        desc = sh("uci -q get mwan3." .. sec .. ".label"),
+        order = #routes + 1,
+        wans = { wanNameOf(pol) },
+        hostIps = { sh("uci -q get mwan3." .. sec .. ".src_ip") },
+        remoteIps = { sh("uci -q get mwan3." .. sec .. ".dest_ip") },
+        remoteDomains = {}, protocol = 'all',
+        timeControl = false, timeSlots = ''
+      }
+    end
+  end
+  return routes
+end
+
+-- ---- 读取：防火墙（连接数上限/端口映射/DMZ/UPnP） ----
+local function getFirewallCfg()
+  local portmaps = {}
+  local out = sh("uci show firewall | grep -E 'firewall%.golden_rd%[0-9]+%.name'")
+  for line in out:gmatch('[^\n]+') do
+    local sec = line:match('^firewall%.(golden_rd%d+)%.name')
+    if sec then
+      portmaps[#portmaps + 1] = {
+        extPort = sh("uci -q get firewall." .. sec .. ".src_dport"),
+        intPort = sh("uci -q get firewall." .. sec .. ".dest_port"),
+        intIp = sh("uci -q get firewall." .. sec .. ".dest_ip")
+      }
+    end
+  end
+  local dmzIp = sh("uci -q get firewall.golden_dmz.dest_ip")
+  return {
+    connMax = tonumber(sh("cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null")) or 0,
+    portmaps = portmaps,
+    dmz = { enable = (dmzIp ~= ''), ip = dmzIp },
+    upnp = {
+      enabled = (sh("uci -q get upnpd.config.enabled") == '1'),
+      secure = (sh("uci -q get upnpd.config.secure_mode") == '1')
+    }
+  }
+end
+
+-- ---- 读取：行为管理-IP段限制（firewall golden_ip*） ----
+local function getBehaviorCfg()
+  local rules = {}
+  local out = sh("uci show firewall | grep -E 'firewall%.golden_ip%[0-9]+%.name'")
+  for line in out:gmatch('[^\n]+') do
+    local sec = line:match('^firewall%.(golden_ip%d+)%.name')
+    if sec then
+      rules[#rules + 1] = { ip = sh("uci -q get firewall." .. sec .. ".src_ip") }
+    end
+  end
+  return { enable = (#rules > 0), ipLimit = rules }
+end
+
+-- ---- 读取：行为管理-访问控制（golden.accessrule_*） ----
+local function getAccessRules()
+  local rules = {}
+  for _, sec in ipairs(listSections('accessrule_')) do
+    rules[#rules + 1] = {
+      id = tonumber(sec:match('(%d+)$')) or 0,
+      active = (sh("uci -q get golden." .. sec .. ".active") == '1'),
+      log = (sh("uci -q get golden." .. sec .. ".log") == '1'),
+      desc = sh("uci -q get golden." .. sec .. ".desc"),
+      action = sh("uci -q get golden." .. sec .. ".action"),
+      order = tonumber(sh("uci -q get golden." .. sec .. ".order")) or 0,
+      range = sh("uci -q get golden." .. sec .. ".range"),
+      remoteIp = sh("uci -q get golden." .. sec .. ".remoteip"),
+      remoteDomain = sh("uci -q get golden." .. sec .. ".remotedomain"),
+      protocol = sh("uci -q get golden." .. sec .. ".protocol"),
+      timeControl = (sh("uci -q get golden." .. sec .. ".timecontrol") == '1'),
+      timeSlots = sh("uci -q get golden." .. sec .. ".timeslots")
+    }
+  end
+  local mode = sh("uci -q get golden.access.mode")
+  if mode == '' then mode = 'disabled' end
+  return { mode = mode, rules = rules }
+end
+
+-- ---- 读取：系统名称 / 系统时间 ----
+local function getSystemName()
+  return { name = sh("uci -q get system.@system[0].hostname") }
+end
+local function getSystemTime()
+  return {
+    time = os.date('%Y-%m-%d %H:%M:%S'),
+    zone = sh("uci -q get system.@system[0].zonename")
+  }
+end
+
+-- ---- 读取：静态路由（network golden_sr*） ----
+local function getStaticRoutes()
+  local routes = {}
+  local out = sh("uci show network | grep -E 'network%.golden_sr%[0-9]+%.target'")
+  for line in out:gmatch('[^\n]+') do
+    local sec = line:match('^network%.(golden_sr%d+)%.target')
+    if sec then
+      routes[#routes + 1] = {
+        desc = sh("uci -q get network." .. sec .. ".name"),
+        dest = sh("uci -q get network." .. sec .. ".target"),
+        mask = sh("uci -q get network." .. sec .. ".netmask"),
+        gateway = sh("uci -q get network." .. sec .. ".gateway"),
+        metric = tonumber(sh("uci -q get network." .. sec .. ".metric")) or 0,
+        iface = sh("uci -q get network." .. sec .. ".interface")
+      }
+    end
+  end
+  return routes
+end
+
+-- ---- 读取：域名重定向（golden.domredir_*） ----
+local function getDomainRedirect()
+  local rules = {}
+  for _, sec in ipairs(listSections('domredir_')) do
+    rules[#rules + 1] = {
+      id = tonumber(sec:match('(%d+)$')) or 0,
+      active = (sh("uci -q get golden." .. sec .. ".active") == '1'),
+      log = (sh("uci -q get golden." .. sec .. ".log") == '1'),
+      desc = sh("uci -q get golden." .. sec .. ".desc"),
+      urlHost = sh("uci -q get golden." .. sec .. ".urlhost"),
+      targetUrl = sh("uci -q get golden." .. sec .. ".targeturl"),
+      urlParam = sh("uci -q get golden." .. sec .. ".urlparam"),
+      redirectTo = sh("uci -q get golden." .. sec .. ".redirectto"),
+      appendUrl = (sh("uci -q get golden." .. sec .. ".appendurl") == '1'),
+      range = sh("uci -q get golden." .. sec .. ".range"),
+      timeControl = (sh("uci -q get golden." .. sec .. ".timecontrol") == '1'),
+      timeSlots = sh("uci -q get golden." .. sec .. ".timeslots")
+    }
+  end
+  return { rules = rules }
+end
+
+-- ---- 读取：MAC 地址设置 ----
+local function getMacSettings()
+  local wans = {}
+  for _, w in ipairs(getWaninfo()) do
+    local def = sh("uci -q get network." .. w.id .. ".macaddr")
+    wans[#wans + 1] = {
+      name = wanNameOf(w.id),
+      default = (def ~= '' and def) or w.mac,
+      current = w.mac
+    }
+  end
+  return {
+    pcMac = sh("cat /sys/class/net/eth0/address 2>/dev/null"),
+    lanDefault = sh("uci -q get network.lan.macaddr"),
+    lanMac = sh("cat /sys/class/net/br-lan/address 2>/dev/null"),
+    wans = wans
+  }
+end
+
+-- ---- 读取：登录爆破封禁列表（xt_recent + 失败计数） ----
+local function getLoginBanList()
+  local banned = {}
+  local raw = readFile('/proc/net/xt_recent/glb')
+  for ln in raw:gmatch('[^\n]+') do
+    local ip = ln:match('src=(%d+%.%d+%.%d+%.%d+)')
+    if ip then banned[#banned + 1] = ip end
+  end
+  return { banned = banned }
+end
+
+-- ---- 读取：带宽保证（golden.guarrule_*） ----
+local function getBandwidthGuarantee()
+  local rules = {}
+  for _, sec in ipairs(listSections('guarrule_')) do
+    rules[#rules + 1] = {
+      id = tonumber(sec:match('(%d+)$')) or 0,
+      active = (sh("uci -q get golden." .. sec .. ".active") == '1'),
+      desc = sh("uci -q get golden." .. sec .. ".desc"),
+      range = sh("uci -q get golden." .. sec .. ".range"),
+      mode = sh("uci -q get golden." .. sec .. ".mode"),
+      up = tonumber(sh("uci -q get golden." .. sec .. ".up")) or 0,
+      down = tonumber(sh("uci -q get golden." .. sec .. ".down")) or 0,
+      wans = {},
+      timeControl = (sh("uci -q get golden." .. sec .. ".timecontrol") == '1'),
+      timeSlots = sh("uci -q get golden." .. sec .. ".timeslots")
+    }
+    local w = sh("uci -q get golden." .. sec .. ".wans")
+    for wn in w:gmatch('[^,]+') do rules[#rules].wans[#rules[#rules].wans + 1] = wn end
+  end
+  return { rules = rules }
+end
+
+-- ---- 重写 getQos：适配前端 qos 对象 ----
+local function getQos()
+  local wans = {}
+  local mode = sh("uci -q get golden.qos.mode")
+  if mode == '' then mode = 'smart' end
+  for _, w in ipairs(getWaninfo()) do
+    local dev = w.ifname
+    local up = tonumber(sh("uci -q get sqm." .. dev .. ".upload")) or 0
+    local down = tonumber(sh("uci -q get sqm." .. dev .. ".download")) or 0
+    wans[#wans + 1] = {
+      name = wanNameOf(w.id),
+      reference = (up > 0 or down > 0) and ('限速 ' .. math.floor(up / 1024) .. 'M/' .. math.floor(down / 1024) .. 'M') or '不设置',
+      up = up, down = down, smin = 5, xmin = 10,
+      status = w.status, upUsage = 0, downUsage = 0
+    }
+  end
+  local exip, exdom = {}, {}
+  for x in sh("uci -q get golden.qos.ex_ip"):gmatch('%S+') do exip[#exip + 1] = { value = x, note = '' } end
+  for x in sh("uci -q get golden.qos.ex_dom"):gmatch('%S+') do exdom[#exdom + 1] = { value = x, note = '' } end
+  return { enabled = (mode ~= 'disable' and mode ~= ''), mode = mode, wans = wans, exceptions = { ip = exip, domain = exdom } }
+end
+
+-- ---- 重写 getDdns：适配前端 ddns 对象 { current, records[] } ----
+local function getDdns()
+  local records = {}
+  local out = sh("uci show ddns | grep -E 'ddns%.golden_ddns%[0-9]+%.enabled'")
+  local i = 0
+  for line in out:gmatch('[^\n]+') do
+    local sid = line:match('^ddns%.(golden_ddns%d+)%.enabled')
+    if sid then
+      i = i + 1
+      local wan = sh("uci -q get ddns." .. sid .. ".interface")
+      local wanIdx = 0
+      local wn = wan:match('^wan(%d)$')
+      if wan == 'wan' then wanIdx = 0 elseif wn then wanIdx = tonumber(wn) - 1 end
+      records[#records + 1] = {
+        id = i, wanIdx = wanIdx, ipMode = 'wan', customIp = '',
+        provider = sh("uci -q get ddns." .. sid .. ".service_name"),
+        username = sh("uci -q get ddns." .. sid .. ".username"),
+        password = '', domain = sh("uci -q get ddns." .. sid .. ".domain"),
+        mx = '', backupMx = false, lastIp = '', status = '已启用'
+      }
+    end
+  end
+  return { selectedIndex = -1, current = records[1] or nil, records = records }
+end
+
+-- ---- 增强 getLbStatus：适配前端 lineStatus 格式 ----
+local function getLbStatus()
+  local lines = {}
+  local out = sh("mwan3 status 2>/dev/null")
+  for line in out:gmatch('[^\n]+') do
+    local iface, st = line:match('^Interface (%S+) .-online%s*: (%a+)')
+    if iface then
+      local online = (st == 'online')
+      lines[#lines + 1] = {
+        wan = wanNameOf(iface),
+        status = online and '联机' or '掉线',
+        weight = 0, defaultLB = '参与',
+        detect = online and '测试成功' or '测试失败',
+        hosts = 0, sessions = 0
+      }
+    end
+  end
+  if #lines == 0 then
+    for _, w in ipairs(getWaninfo()) do
+      lines[#lines + 1] = {
+        wan = wanNameOf(w.id),
+        status = (w.status == '在线' and '联机') or w.status,
+        weight = 0, defaultLB = '参与',
+        detect = (w.status == '在线' and '测试成功' or '测试失败'),
+        hosts = 0, sessions = 0
+      }
+    end
+  end
+  return lines
+end
+
+-- ==================== 写入分发 ====================
+local SET_DISPATCH = {
+  ['network.wan'] = saveWan,
+  ['network.lan'] = saveLan,
+  ['dhcp'] = saveDhcp,
+  ['system'] = saveSystem,
+  ['qos'] = saveQos,
+  ['lb'] = saveLb,
+  ['agg'] = saveAgg,
+  ['ddns'] = saveDdns,
+  ['firewall'] = saveFirewall,
+  ['arp'] = saveArp,
+  ['behavior'] = saveBehavior,
+  ['policy'] = savePolicy,
+  ['advanced'] = saveAdvanced,
+  ['admin'] = saveAdmin,
+  ['domainresolve'] = saveDomainResolve,
+  ['speedlimit'] = saveSpeedLimit,
+  ['connlimit'] = saveConnLimit,
+  ['ddos'] = saveDdos,
+  ['dhcpdetect'] = saveDhcpDetect,
+  ['domainfilter'] = saveDomainFilter,
+  ['applimit'] = saveAppLimit,
+  ['ctcnc'] = saveCtcnc,
+  ['porttrigger'] = savePortTrigger,
+  ['mirror'] = saveMirror,
+  ['arpdefense'] = saveArpDefense,
+  ['wanharden'] = saveWanHarden,
+  ['dnsaudit'] = saveDnsAudit,
+  ['staticroutes'] = saveStaticRoutes,
+  ['domainredirect'] = saveDomainRedirect,
+  ['macsettings'] = saveMacSettings,
+  ['accessrules'] = saveAccessRules,
+  ['bandwidthguarantee'] = saveBandwidthGuarantee
+}
+
+-- ==================== 操作 ====================
+local function runPing(host)
+  host = sanitize(host, '^[%w_%-%.]+$')
+  if host == '' then error('host 参数缺失') end
+  local out = sh("ping -c 4 -W 2 '" .. host .. "' 2>&1")
+  local sent = out:match('(%d+) packets transmitted') or '4'
+  local recv = out:match('(%d+) packets received') or '0'
+  local loss = out:match('(%d+)%% packet loss') or '100'
+  local min = out:match('min/avg/max.*= [%d%.]+/([%d%.]+)/') or ''
+  local result = { host = host, sent = sent, received = recv, loss = loss .. '%', avg = min }
+  -- 逐行输出
+  local rows = {}
+  for line in out:gmatch('[^\n]+') do
+    local seq, ttl, t = line:match('icmp_seq=(%d+) ttl=(%d+) time=([%d%.]+) ms')
+    if seq then rows[#rows + 1] = { seq = seq, ttl = ttl, time = t } end
+  end
+  result.rows = rows
+  return result
+end
+
+-- ==================== 读取分发 ====================
+local GET_MAP = {
+  all = function() return {
+    sysinfo = getSysinfo(), laninfo = getLaninfo(), waninfo = getWaninfo(),
+    hosts = getHosts(), arp = { list = getArpList(), bindings = getBindings() },
+    traffic = getTraffic(), conns = getConns(), logs = getLogs(20),
+    access = getAccess(), admin = getAdmin(), dhcp = getDhcp(),
+    loginusers = getLoginUsers(), domainresolve = getDomainResolve(),
+    domainfilter = getDomainFilter(), applimit = getAppLimit(), ctcnc = getCtcnc(),
+    porttrigger = getPortTrigger(), mirror = getMirror(), arpdefense = getArpDefense(),
+    arplogs = getArpLogs(50), wanharden = getWanHarden(),
+    dnsblocklogs = getDnsBlockLogs(50),
+    -- 批8：真实数据全量域
+    qos = getQos(), loadbalance = getLoadBalance(), bandwidthagg = getBandwidthAgg(),
+    ddns = getDdns(), speedlimit = getSpeedLimit(), bandwidthguarantee = getBandwidthGuarantee(),
+    connlimit = getConnLimit(), ddos = getDdos(), dhcpdetect = getDhcpDetect(),
+    dhcpdetectlogs = getDhcpDetectLogs(50),
+    upnp = getUpnp(), lbstatus = getLbStatus(), policyroutes = getPolicyRoutes(),
+    firewall = getFirewallCfg(), behavior = getBehaviorCfg(), accessrules = getAccessRules(),
+    systemname = getSystemName(), systemtime = getSystemTime(),
+    staticroutes = getStaticRoutes(), domainredirect = getDomainRedirect(),
+    macsettings = getMacSettings(), loginbanlist = getLoginBanList(),
+    secevents = getSecEvents(200, ''), banlist = getBlockList(),
+    dnsaudit = { enabled = (sh('uci -q get golden.dnsaudit.enabled') == '1') },
+    dnsauditlogs = getDnsAudit('', 200) } end,
+  sysinfo = getSysinfo, laninfo = getLaninfo, waninfo = getWaninfo,
+  hosts = getHosts,
+  arp = function() return { list = getArpList(), bindings = getBindings() } end,
+  traffic = getTraffic, conns = getConns, logs = function() return getLogs(tonumber(args.limit) or 30) end,
+  processes = getProcesses,
+  lbstatus = getLbStatus, upnp = getUpnp, ddns = getDdns, qos = getQos,
+  access = getAccess, admin = getAdmin, dhcp = getDhcp,
+  loginusers = getLoginUsers, domainresolve = getDomainResolve,
+  speedlimit = getSpeedLimit, connlimit = getConnLimit, ddos = getDdos,
+  dhcpdetect = getDhcpDetect,
+  dhcpdetectlogs = function() return getDhcpDetectLogs(tonumber(args.limit) or 50) end,
+  domainfilter = getDomainFilter, applimit = getAppLimit, ctcnc = getCtcnc,
+  porttrigger = getPortTrigger, mirror = getMirror, arpdefense = getArpDefense,
+  wanharden = getWanHarden,
+  dnsblocklogs = function() return getDnsBlockLogs(tonumber(args.limit) or 50) end,
+  arplogs = function() return getArpLogs(tonumber(args.limit) or 50) end,
+  secevents = function() return getSecEvents(tonumber(args.limit) or 200, args.type or '') end,
+  banlist = getBlockList,
+  dnsaudit = function() return { enabled = (sh('uci -q get golden.dnsaudit.enabled') == '1') } end,
+  dnsauditlogs = function() return getDnsAudit(args.ip or '', tonumber(args.limit) or 200) end,
+  -- 批8：全量真实数据域
+  qos = getQos, loadbalance = getLoadBalance, bandwidthagg = getBandwidthAgg,
+  ddns = getDdns, speedlimit = getSpeedLimit, bandwidthguarantee = getBandwidthGuarantee,
+  connlimit = getConnLimit, ddos = getDdos, dhcpdetect = getDhcpDetect,
+  dhcpdetectlogs = function() return getDhcpDetectLogs(tonumber(args.limit) or 50) end,
+  upnp = getUpnp, lbstatus = getLbStatus, policyroutes = getPolicyRoutes,
+  firewall = getFirewallCfg, behavior = getBehaviorCfg, accessrules = getAccessRules,
+  systemname = getSystemName, systemtime = getSystemTime,
+  staticroutes = getStaticRoutes, domainredirect = getDomainRedirect,
+  macsettings = getMacSettings, loginbanlist = getLoginBanList,
+  config = function() return { sysinfo = getSysinfo(), laninfo = getLaninfo(), waninfo = getWaninfo(), access = getAccess(), admin = getAdmin(), dhcp = getDhcp() } end
+}
+
+-- ==================== 主逻辑 ====================
+local ok, payload
+ok, payload = pcall(function()
+  local action = args.action or 'all'
+
+  -- 认证接口（无需登录）
+  if action == 'auth' then
+    local an = args.name or ''
+    if an == 'login' then
+      local method = os.getenv('REQUEST_METHOD') or 'GET'
+      local body = ''
+      if method == 'POST' then
+        local cl = tonumber(os.getenv('CONTENT_LENGTH') or '0') or 0
+        if cl > 0 and cl < 1048576 then body = io.read(cl) end
+      end
+      local raw = body
+      if raw == '' and args.json then raw = urldecode(args.json) end
+      local data = {}
+      if raw ~= '' then
+        local parsed = json_parse(raw)
+        if type(parsed) == 'table' then data = parsed end
+      end
+      return authLogin(data)
+    elseif an == 'check' then
+      return authCheck(headerToken() ~= '' and headerToken() or args.token or '')
+    elseif an == 'logout' then
+      return authLogout(headerToken() ~= '' and headerToken() or args.token or '')
+    end
+    error('未知认证操作: ' .. an)
+  end
+
+  -- 写操作：先解析 body，再校验 token + admin 权限（CSRF 防护 + guest 只读）
+  if action == 'set' or action == 'write' then
+    local raw = readPostBody(1048576)
+    if raw == '' and args.json then raw = urldecode(args.json) end
+    local data = {}
+    if raw ~= '' then
+      local parsed = json_parse(raw)
+      if type(parsed) == 'table' then data = parsed end
+    end
+    local sess = checkSession(headerToken() ~= '' and headerToken() or data.token or '')
+    if not sess then error({ code = 401, msg = '未登录或会话已过期' }) end
+    if sess.role ~= 'admin' then error({ code = 403, msg = '访客账号为只读权限，不能修改配置' }) end
+    local domain = data.domain or args.domain
+    local config = data.config or {}
+    local fn = SET_DISPATCH[domain]
+    if not fn then error('未知配置域: ' .. tostring(domain)) end
+    fn(config)
+    return { saved = true, domain = domain }
+  end
+
+  -- 其余接口：必须登录（token 一律从请求头获取）
+  local sess = checkSession(headerToken())
+  if not sess then error({ code = 401, msg = '未登录或会话已过期' }) end
+
+  if action == 'run' then
+    if sess.role ~= 'admin' then error({ code = 403, msg = '访客账号为只读权限，不能执行操作' }) end
+    local name = args.name or ''
+    if name == 'ping' then return runPing(args.host or '') end
+    if name == 'login-banlist' then
+      -- 当前被 iptables 封禁的登录爆破来源（读 recent 内核表）
+      local banned = {}
+      local raw = readFile('/proc/net/xt_recent/glb')
+      for ln in raw:gmatch('[^\n]+') do
+        local ip = ln:match('src=(%d+%.%d+%.%d+%.%d+)')
+        if ip then banned[#banned + 1] = ip end
+      end
+      return { banned = banned }
+    end
+    if name == 'login-unban' then
+      -- 手动解封：移除 recent 标记 + 清除应用层失败计数
+      requirePost()
+      local ip = sanitize(args.ip or '', '^%d+%.%d+%.%d+%.%d+$')
+      if ip == '' then error('请输入要解封的 IP 地址') end
+      os.execute("iptables -D golden_login -m recent --name glb --set -j DROP -s " .. ip .. " 2>/dev/null")
+      -- xt_recent 解封：写 -IP 到内核表（sed -i 对 /proc 无效）
+      os.execute("echo '-" .. ip .. "' > /proc/net/xt_recent/glb 2>/dev/null")
+      os.execute('rm -f ' .. LOCK_DIR .. '/' .. ip)
+      return { unbanned = ip }
+    end
+    if name == 'reboot' then requirePost() os.execute('/sbin/reboot &') return { rebooted = true } end
+    if name == 'poweroff' then requirePost() os.execute('/sbin/poweroff &') return { poweredOff = true } end
+    if name == 'reset' then
+      requirePost()
+      os.execute('/sbin/firstboot -y >/dev/null 2>&1; /sbin/reboot &')
+      return { reset = true }
+    end
+    if name == 'restartservice' then
+      requirePost()
+      local svc = sanitize(args.service, '^[%w_%-]+$')
+      os.execute('/etc/init.d/' .. svc .. ' restart 2>/dev/null &')
+      return { restarted = svc }
+    end
+    if name == 'arplog-clear' then
+      requirePost()
+      os.execute('rm -f /tmp/golden_arplog')
+      return { cleared = true }
+    end
+    if name == 'dnsblock-clear' then
+      -- 清空域名拦截审计日志（批4）
+      requirePost()
+      os.execute('rm -f /tmp/golden_dnsblock.log')
+      return { cleared = true }
+    end
+    if name == 'dnsaudit-clear' then
+      -- 清空上网行为审计日志（批5）
+      requirePost()
+      os.execute('rm -f /tmp/golden_dnsaudit.log')
+      return { cleared = true }
+    end
+    if name == 'block-ip' then
+      -- 一键封禁：UCI 持久化 + iptables golden_block 链 DROP 该 IP 全部流量
+      requirePost()
+      local ip = sanitize(args.ip or '', '^%d+%.%d+%.%d+%.%d+$')
+      if ip == '' then error('请输入要封禁的 IP 地址') end
+      local exists = false
+      for _, x in ipairs(getBlockList().banned) do if x == ip then exists = true break end end
+      if not exists then
+        os.execute("uci -q delete golden.blocklist 2>/dev/null; uci set golden.blocklist=blocklist; uci add_list golden.blocklist.ip='" .. ip .. "'; uci commit golden")
+      end
+      applyBlockIp(ip, true)
+      os.execute("logger -t golden-sec 'block-ip " .. ip .. "' 2>/dev/null")
+      return { blocked = ip }
+    end
+    if name == 'unblock-ip' then
+      -- 解除封禁：从 UCI 列表移除 + 删除 iptables 规则
+      requirePost()
+      local ip = sanitize(args.ip or '', '^%d+%.%d+%.%d+%.%d+$')
+      if ip == '' then error('请输入要解封的 IP 地址') end
+      os.execute("uci -q del_list golden.blocklist.ip='" .. ip .. "'; uci commit golden")
+      applyBlockIp(ip, false)
+      os.execute("logger -t golden-sec 'unblock-ip " .. ip .. "' 2>/dev/null")
+      return { unblocked = ip }
+    end
+    if name == 'backup' then
+      -- 系统参数备份：打包 /etc/config + /etc/golden → tar.gz → 纯 Lua base64
+      requirePost()
+      os.execute('tar czf /tmp/golden-backup.tar.gz /etc/config /etc/golden 2>/dev/null')
+      -- busybox 无 stat applet，改用 wc -c 取文件大小
+      local size = tonumber(sh('wc -c < /tmp/golden-backup.tar.gz') or '0') or 0
+      if size == 0 then error('备份失败：未找到可备份的配置') end
+      local b64 = b64encode(readFile('/tmp/golden-backup.tar.gz'))
+      return { filename = 'golden-backup-' .. os.date('%Y%m%d-%H%M%S') .. '.tar.gz', size = size, b64 = b64 }
+    end
+    if name == 'restore' then
+      -- 恢复参数：body = JSON {filename, b64}，恢复前自动备份当前配置
+      local method = os.getenv('REQUEST_METHOD') or 'GET'
+      if method ~= 'POST' then error('请通过 POST 上传备份文件') end
+      local cl = tonumber(os.getenv('CONTENT_LENGTH') or '0') or 0
+      if cl <= 0 or cl > 33554432 then error('备份文件大小无效（最大 32MB）') end
+      local raw = io.read(cl) or ''
+      local data = {}
+      local parsed = json_parse(raw)
+      if type(parsed) == 'table' then data = parsed end
+      local b64 = tostring(data.b64 or ''):gsub('%s+', '')
+      if b64 == '' then error('未收到备份文件内容') end
+      -- 纯 Lua base64 解码后直接写二进制（busybox 默认无 base64 applet）
+      local bin = b64decode(b64)
+      if #bin < 100 then error('备份文件无效或已损坏') end
+      local bf = io.open('/tmp/golden-restore.tar.gz', 'wb')
+      if not bf then error('无法写入临时文件') end
+      bf:write(bin)
+      bf:close()
+      -- 安全校验：tar 内容必须限定在 etc/config 与 etc/golden
+      local listing = sh("tar tzf /tmp/golden-restore.tar.gz 2>/dev/null")
+      if listing == '' then error('备份文件无效或已损坏') end
+      for line in listing:gmatch('[^\n]+') do
+        if line:match('^/') or line:match('%.%./') then error('备份文件包含非法路径') end
+        if not (line:match('^etc/config/') or line:match('^etc/golden/')) then
+          error('备份文件包含未知路径: ' .. line)
+        end
+      end
+      -- 恢复前自动备份当前配置
+      os.execute('tar czf /tmp/golden-pre-restore-' .. os.date('%Y%m%d-%H%M%S') .. '.tar.gz /etc/config /etc/golden 2>/dev/null')
+      os.execute('tar xzf /tmp/golden-restore.tar.gz -C / 2>/dev/null')
+      os.execute('/etc/init.d/network reload 2>/dev/null &')
+      os.execute('/etc/init.d/dnsmasq restart 2>/dev/null &')
+      os.execute('/etc/init.d/firewall reload 2>/dev/null &')
+      return { restored = true, preBackup = '/tmp/golden-pre-restore-*.tar.gz' }
+    end
+    if name == 'upgrade' then
+      -- 固件升级第一步：上传原始 .bin（body=二进制）→ sysupgrade -T 完整性校验
+      local method = os.getenv('REQUEST_METHOD') or 'GET'
+      if method ~= 'POST' then error('请通过 POST 上传固件文件') end
+      local cl = tonumber(os.getenv('CONTENT_LENGTH') or '0') or 0
+      if cl < 1048576 or cl > 67108864 then error('固件大小无效（需 1MB-64MB）') end
+      local f = io.open('/tmp/golden-fw.bin', 'wb')
+      local remain = cl
+      while remain > 0 do
+        local chunk = io.read(math.min(remain, 65536))
+        if not chunk then break end
+        f:write(chunk)
+        remain = remain - #chunk
+      end
+      f:close()
+      if remain > 0 then error('固件上传不完整，请重试') end
+      local rc = os.execute('sysupgrade -T /tmp/golden-fw.bin >/tmp/golden-upgrade-check.log 2>&1')
+      if rc ~= 0 then
+        local msg = readFile('/tmp/golden-upgrade-check.log'):gsub('[\r\n]+', ' ')
+        error('固件校验失败，已取消升级' .. (msg ~= '' and ('：' .. msg) or ''))
+      end
+      local size = tonumber(sh('wc -c < /tmp/golden-fw.bin') or '0') or 0
+      local md5 = sh("md5sum /tmp/golden-fw.bin | awk '{print $1}'")
+      return { verified = true, size = size, md5 = md5 }
+    end
+    if name == 'upgrade-confirm' then
+      -- 固件升级第二步：用户输入 yes 确认后执行（保留配置）
+      requirePost()
+      local f = io.open('/tmp/golden-fw.bin', 'r')
+      if not f then error('固件文件不存在，请重新上传') end
+      f:close()
+      os.execute('nohup sysupgrade /tmp/golden-fw.bin >/dev/null 2>&1 &')
+      return { rebooting = true }
+    end
+    if name == 'ctcnc-default' then
+      -- 使用内置精简默认地址表
+      requirePost()
+      local key = sanitize(args.key or '', '^[%w]+$')
+      if not IPLIB_KEYS[key] then error('未知地址库: ' .. tostring(args.key)) end
+      local lines = DEFAULT_IPLIB[key]
+      if not lines then error('该地址库无内置默认表') end
+      local count = writeIpLib(key, lines)
+      uciSet('golden', 'ctcnc_' .. key, 'enabled', '1')
+      uciCommit('golden')
+      os.execute('sh /etc/golden/ctcnc.sh restart 2>/dev/null &')
+      return { imported = count, key = key }
+    end
+    if name == 'ctcnc-download' then
+      -- 联网下载完整地址表（wget，带超时）
+      requirePost()
+      local key = sanitize(args.key or '', '^[%w]+$')
+      local url = IPLIB_URL[key]
+      if not url then error('该地址库暂不支持在线下载') end
+      os.execute('wget -q -T 20 -O /tmp/golden-ip.txt "' .. url .. '" 2>/dev/null')
+      local raw = readFile('/tmp/golden-ip.txt')
+      if raw == '' then error('下载失败：请检查网络连通后重试') end
+      local lines = {}
+      for ln in raw:gmatch('[^\n]+') do
+        local cidr = ln:gsub('%s+', ''):gsub('\r', '')
+        if cidr:match('^%d+%.%d+%.%d+%.%d+/%d+$') then lines[#lines + 1] = cidr end
+      end
+      if #lines == 0 then error('下载内容无效（未解析到 IP 段）') end
+      local count = writeIpLib(key, lines)
+      uciSet('golden', 'ctcnc_' .. key, 'enabled', '1')
+      uciCommit('golden')
+      os.execute('sh /etc/golden/ctcnc.sh restart 2>/dev/null &')
+      return { imported = count, key = key }
+    end
+    if name == 'ctcnc-import' then
+      -- 上传地址文件：POST body = JSON {key, lines[]}
+      local method = os.getenv('REQUEST_METHOD') or 'GET'
+      if method ~= 'POST' then error('请通过 POST 上传地址文件') end
+      local cl = tonumber(os.getenv('CONTENT_LENGTH') or '0') or 0
+      if cl <= 0 or cl > 2097152 then error('地址文件过大（最大 2MB）') end
+      local raw = io.read(cl) or ''
+      local data = {}
+      local parsed = json_parse(raw)
+      if type(parsed) == 'table' then data = parsed end
+      local key = sanitize(tostring(data.key or ''), '^[%w]+$')
+      if not IPLIB_KEYS[key] then error('未知地址库: ' .. tostring(data.key)) end
+      if type(data.lines) ~= 'table' then error('缺少地址段内容') end
+      local count = writeIpLib(key, data.lines)
+      uciSet('golden', 'ctcnc_' .. key, 'enabled', '1')
+      uciCommit('golden')
+      os.execute('sh /etc/golden/ctcnc.sh restart 2>/dev/null &')
+      return { imported = count, key = key }
+    end
+    error('未知操作: ' .. name)
+  elseif action == 'get' or action == 'read' then
+    local name = args.name or 'all'
+    local fn = GET_MAP[name]
+    if not fn then error('未知读取: ' .. name) end
+    return fn()
+  elseif GET_MAP[action] then
+    return GET_MAP[action]()
+  else
+    error('未知接口: ' .. action)
+  end
+end)
+
+io.write('Content-Type: application/json; charset=utf-8\r\n\r\n')
+if ok then
+  io.write(jenc({ ok = true, error = '', payload = payload }))
+else
+  local code = 500
+  local msg = tostring(payload)
+  if type(payload) == 'table' then
+    code = payload.code or 500
+    msg = payload.msg or '未知错误'
+  end
+  io.write(jenc({ ok = false, code = code, error = msg, payload = {} }))
+end

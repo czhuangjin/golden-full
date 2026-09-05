@@ -1,0 +1,59 @@
+#!/bin/sh /etc/rc.common
+# ============================================================
+# 黄金定制 — 私接 DHCP 探测守护
+# 实现: iptables 捕获非本机发出的 DHCP OFFER（源端口 67，经 INPUT）
+#       + logread 持续跟踪，检测结果写入 /tmp/golden_dhcpdetect.log
+# 配置: UCI golden.dhcpdetect.intercept=1|0（拦截私接 DHCP）
+#            golden.dhcpdetect.interval=30（日志去重窗口，秒）
+# 注意: 本机 dnsmasq 发出的 OFFER 不经过 INPUT 链，不会被误报；
+#       合法 DHCP 中继（relay）场景可能误报，请确认网络拓扑。
+# ============================================================
+
+START=95
+STOP=10
+
+IPT=/usr/sbin/iptables
+PIDFILE=/var/run/golden_dhcpdetect.pid
+LOGFILE=/tmp/golden_dhcpdetect.log
+
+start() {
+  stop
+
+  : > "$LOGFILE"
+  chmod 644 "$LOGFILE"
+
+  # 记录非本机 DHCP OFFER（含源 MAC），限速防刷屏
+  $IPT -N golden_dhcpdetect 2>/dev/null || $IPT -F golden_dhcpdetect
+  $IPT -A golden_dhcpdetect -p udp --sport 67 -m limit --limit 10/min --limit-burst 20 -j LOG --log-prefix "GOLDEN_DHCP " --log-level 6 2>/dev/null
+
+  # 可选：拦截私接 DHCP（丢弃其 OFFER，客户端收不到错误地址）
+  local intercept
+  intercept=$(uci -q get golden.dhcpdetect.intercept)
+  [ "$intercept" = "1" ] && $IPT -A golden_dhcpdetect -p udp --sport 67 -j DROP 2>/dev/null
+
+  $IPT -I INPUT -j golden_dhcpdetect 2>/dev/null
+
+  # 守护循环：跟踪内核日志，提取私接 DHCP 信息并去重记录
+  ( logread -f -e GOLDEN_DHCP | while read line; do
+      local src mac ts
+      src=$(echo "$line" | sed -n 's/.*SRC=\([0-9.]\{7,15\}\).*/\1/p')
+      [ -n "$src" ] || continue
+      mac=$(echo "$line" | sed -n 's/.*MAC=\([0-9A-Fa-f:]\{17\}\).*/\1/p')
+      ts=$(date '+%Y-%m-%d %H:%M:%S')
+      # 去重：同源 IP 未出现过才记录
+      if ! grep -q "|$src|" "$LOGFILE" 2>/dev/null; then
+        echo "$ts|检测到私接 DHCP 服务器: $src (MAC: ${mac:-未知}), 已记录!" >> "$LOGFILE"
+      fi
+    done ) &
+  echo $! > "$PIDFILE"
+}
+
+stop() {
+  [ -f "$PIDFILE" ] && {
+    kill "$(cat "$PIDFILE")" 2>/dev/null
+    rm -f "$PIDFILE"
+  }
+  $IPT -D INPUT -j golden_dhcpdetect 2>/dev/null
+  $IPT -F golden_dhcpdetect 2>/dev/null
+  $IPT -X golden_dhcpdetect 2>/dev/null
+}

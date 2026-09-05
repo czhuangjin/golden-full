@@ -1,0 +1,111 @@
+#!/bin/sh /etc/rc.common
+# 黄金定制 — 批3/批5 防火墙/系统规则聚合启动
+# 依次应用：域名过滤 / 应用限制 / 端口触发 / 镜像端口 / 电信网通地址 / ARP 安全防御 / 登录爆破封禁链 / 一键封禁黑名单
+# START=98：在 dnsmasq(19)/防火墙(20)/网络 之后运行，确保接口就绪
+
+START=98
+STOP=10
+
+# 登录爆破封禁链：被标记的 IP 在 golden_ban_seconds 秒内所有连接 DROP（golden-api 失败达阈值时打标）
+# 时长读 UCI system.@system[0].golden_ban_seconds（默认 600 秒；设 0 = 仅应用层锁定，不下发内核封禁）。
+# 注意：此链挂 INPUT 首位，被标记 IP 连 HTTP 80 都会被 DROP —— 排障时反复试登录会把自己锁死，
+#       表现为“服务在跑但页面打不开”。解封：iptables -F golden_login；或重启路由器（recent 表在内存）。
+init_login_ban() {
+  modprobe xt_recent 2>/dev/null
+  local ban_sec="$(uci -q get system.@system[0].golden_ban_seconds 2>/dev/null)"
+  iptables -N golden_login 2>/dev/null
+  iptables -F golden_login 2>/dev/null
+  if [ -z "$ban_sec" ] || [ "$ban_sec" = "0" ]; then
+    iptables -A golden_login -j RETURN 2>/dev/null
+  else
+    iptables -A golden_login -m recent --name glb --rcheck --seconds "$ban_sec" -j DROP 2>/dev/null
+    iptables -A golden_login -j RETURN 2>/dev/null
+  fi
+  iptables -D INPUT -j golden_login 2>/dev/null
+  iptables -I INPUT -j golden_login 2>/dev/null
+}
+
+# 一键封禁黑名单（批5）：从 UCI golden.blocklist.ip 重放 iptables golden_block 链
+apply_blocklist() {
+  iptables -N golden_block 2>/dev/null
+  iptables -F golden_block 2>/dev/null
+  uci -q get golden.blocklist.ip 2>/dev/null | while read -r ip; do
+    [ -n "$ip" ] && iptables -A golden_block -s "$ip" -j DROP 2>/dev/null
+  done
+  iptables -D FORWARD -j golden_block 2>/dev/null
+  iptables -D INPUT -j golden_block 2>/dev/null
+  iptables -I FORWARD -j golden_block 2>/dev/null
+  iptables -I INPUT -j golden_block 2>/dev/null
+}
+
+# 【v1.1.1 加固】管理服务自愈：每次开机兜底拉起 uhttpd + dropbear，并显式放行
+# 局域网管理端口（80/443/22）。即使首启脚本 90-golden 因故未完整执行，此处也能保证
+# Web 后台可用 —— 消除“服务没起来/端口被挡”导致的登录页打不开。
+ensure_web() {
+  # 1) uhttpd 必须 enable 且在监听 80；否则强制拉起
+  /etc/init.d/uhttpd enable 2>/dev/null
+  if ! netstat -tln 2>/dev/null | grep -q ':80 '; then
+    /etc/init.d/uhttpd start 2>/dev/null || /etc/init.d/uhttpd restart 2>/dev/null
+  fi
+  # 1.1) 证书损坏自愈：拉起后仍无 80 监听，说明 uhttpd 大概率因加载坏证书
+  #      crash loop（日志特征 "Failed to load certificate/key files"）。
+  #      此时退回纯 HTTP：删掉 https/证书配置再重启，保证后台一定能打开。
+  if ! netstat -tln 2>/dev/null | grep -q ':80 '; then
+    uci -q delete uhttpd.main.listen_https
+    uci -q delete uhttpd.main.cert
+    uci -q delete uhttpd.main.key
+    uci -q commit uhttpd
+    /etc/init.d/uhttpd restart 2>/dev/null
+  fi
+  # 2) 兜底放行管理端口（插到 golden_login 之后，被标记 IP 仍受登录封禁约束）
+  for p in 80 443 22; do
+    iptables -C INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null || \
+      iptables -I INPUT 2 -p tcp --dport "$p" -j ACCEPT 2>/dev/null
+  done
+  # 3) golden 页面缺失时给出可读提示（防“404/白屏”误判为没起服务）
+  if [ ! -f /www/golden/index.html ]; then
+    mkdir -p /www/golden
+    echo '<html><body style="font-family:sans-serif;background:#0f172a;color:#e2e8f0;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;">黄金定制页面文件缺失，请重新编译 golden 包或检查安装</body></html>' > /www/golden/index.html
+  fi
+  # 4) 首页跳转兜底（/ 直接进 /golden/）
+  if [ ! -f /www/index.html ]; then
+    echo '<html><head><meta http-equiv="refresh" content="0;url=/golden/"></head></html>' > /www/index.html
+  fi
+}
+
+start() {
+  init_login_ban
+  apply_blocklist
+  ensure_web
+  sh /etc/golden/domainfilter.sh start 2>/dev/null
+  sh /etc/golden/dnsaudit.sh start 2>/dev/null
+  sh /etc/golden/applimit.sh start 2>/dev/null
+  sh /etc/golden/porttrigger.sh start 2>/dev/null
+  sh /etc/golden/mirror.sh start 2>/dev/null
+  sh /etc/golden/ctcnc.sh start 2>/dev/null
+  sh /etc/golden/arpdefense.sh start 2>/dev/null
+  sh /etc/golden/wanharden.sh start 2>/dev/null
+}
+
+stop() {
+  iptables -D INPUT -j golden_login 2>/dev/null
+  iptables -F golden_login 2>/dev/null
+  iptables -X golden_login 2>/dev/null
+  iptables -D FORWARD -j golden_block 2>/dev/null
+  iptables -D INPUT -j golden_block 2>/dev/null
+  iptables -F golden_block 2>/dev/null
+  iptables -X golden_block 2>/dev/null
+  sh /etc/golden/wanharden.sh stop 2>/dev/null
+  sh /etc/golden/arpdefense.sh stop 2>/dev/null
+  sh /etc/golden/ctcnc.sh stop 2>/dev/null
+  sh /etc/golden/mirror.sh stop 2>/dev/null
+  sh /etc/golden/porttrigger.sh stop 2>/dev/null
+  sh /etc/golden/applimit.sh stop 2>/dev/null
+  sh /etc/golden/dnsaudit.sh stop 2>/dev/null
+  sh /etc/golden/domainfilter.sh stop 2>/dev/null
+}
+
+restart() {
+  stop
+  start
+}
