@@ -1,0 +1,243 @@
+name: 黄金定制 软路由云编译
+
+# 触发方式：
+# 1. 代码 push 到 main/master 分支
+# 2. 手动：Actions 页面 → Run workflow（推荐）
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: 编译 x86_64 固件
+    runs-on: ubuntu-22.04
+    timeout-minutes: 240
+
+    steps:
+      - name: 清理磁盘空间
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/powershell 2>/dev/null || true
+          sudo apt-get purge -y '^mysql*' '^mongo*' '^dotnet*' 2>/dev/null || true
+          sudo apt-get autoremove -y 2>/dev/null || true
+          df -h
+
+      - name: 检出工程代码
+        uses: actions/checkout@v4
+
+      - name: 安装编译依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
+            gettext git libncurses-dev libssl-dev python3-setuptools rsync swig unzip zlib1g-dev \
+            file wget curl time ccache
+          sudo ln -sf /usr/bin/python3 /usr/bin/python
+          echo "=== 环境就绪 ==="
+
+      - name: 恢复编译缓存（ccache + 源码包）
+        uses: actions/cache@v4
+        with:
+          path: |
+            openwrt/dl
+            openwrt/.ccache
+          key: golden-${{ github.ref_name }}-${{ github.run_number }}
+          restore-keys: |
+            golden-${{ github.ref_name }}-
+            golden-
+
+      - name: 下载 OpenWrt 源码（v23.05.5 稳定版）
+        run: |
+          set -e
+          retry_git_clone() {
+            local url="$1"
+            local dest="$2"
+            local branch="${3:-v23.05.5}"
+            local max_attempts=3
+            local i
+            for i in $(seq 1 $max_attempts); do
+              rm -rf "$dest"
+              echo ">>> 尝试 $i/$max_attempts: clone $url -> $dest"
+              if git clone -b "$branch" --depth 1 "$url" "$dest"; then
+                echo "✅ $dest clone 成功"
+                return 0
+              fi
+              echo "⚠️ $dest 第 $i 次失败"
+              if [ "$i" -lt "$max_attempts" ]; then
+                echo "等待 10 秒后重试..."
+                sleep 10
+              fi
+            done
+            echo "❌ $dest 连续 $max_attempts 次 clone 失败"
+            return 1
+          }
+          retry_git_clone https://github.com/openwrt/openwrt.git openwrt v23.05.5
+          retry_git_clone https://github.com/openwrt/packages.git openwrt/package/packages openwrt-23.05
+          retry_git_clone https://github.com/openwrt/luci.git openwrt/package/luci openwrt-23.05
+          echo "=== 源码下载完成 ==="
+
+      - name: 拷贝黄金定制包
+        run: |
+          cp -r package/golden openwrt/package/golden
+          echo "=== golden 包已就位 ==="
+
+      - name: 更新并安装 feeds
+        run: |
+          cd openwrt
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+          echo "=== feeds 就绪 ==="
+
+      - name: 生成编译配置
+        run: |
+          cd openwrt
+          cat > .config << 'EOF'
+          # ===== 目标平台：x86 64 位（通用） =====
+          CONFIG_TARGET_x86=y
+          CONFIG_TARGET_x86_64=y
+          CONFIG_TARGET_x86_64_Generic=y
+
+          # ===== 基础 =====
+          CONFIG_PACKAGE_luci=y
+          CONFIG_PACKAGE_luci-mod-admin-full=y
+          CONFIG_LUCI_LANG_zh-cn=y
+          CONFIG_PACKAGE_luci-i18n-base-zh-cn=y
+          CONFIG_PACKAGE_luci-i18n-firewall-zh-cn=y
+
+          # ===== 黄金定制管理后台 =====
+          CONFIG_PACKAGE_golden=y
+
+          # ===== 黄金定制后台真实功能依赖 =====
+          # 上网行为审计需要 dnsmasq-full（log-queries=extra）
+          # 关键：必须显式关闭基础 dnsmasq！x86 默认包自带 dnsmasq，若两个同时启用
+          #       会因文件冲突（/usr/sbin/dnsmasq）导致 package/install Error 255
+          CONFIG_PACKAGE_dnsmasq=n
+          CONFIG_PACKAGE_dnsmasq-full=y
+          # 登录爆破封禁 / 端口扫描检测（-m recent / -m connlimit，23.05 并入 kmod-ipt-conntrack-extra）
+          CONFIG_PACKAGE_kmod-ipt-conntrack-extra=y
+          # 按时间 / ttl 限速（-m time / -m ttl）
+          CONFIG_PACKAGE_kmod-ipt-extra=y
+          # ★ 用户态 iptables 命令（23.05 默认是 fw4/nftables，没有 iptables 命令时
+          #   golden 全部防火墙脚本/登录封禁/一键封禁会静默失效！）
+          CONFIG_PACKAGE_iptables-nft=y
+          CONFIG_PACKAGE_iptables-mod-conntrack-extra=y
+          CONFIG_PACKAGE_iptables-mod-iprange=y
+          CONFIG_PACKAGE_iptables-mod-ipopt=y
+          # 一键封禁黑名单 / 电信联通地址库（ipset + set 匹配）
+          CONFIG_PACKAGE_ipset=y
+          # ★ busybox applet 开关（默认裁剪会导致对应功能静默失败）：
+          #   cryptpw —— /etc/shadow 密码校验核心（无它则改密码功能残废）；
+          #   base64/stat —— 参数备份恢复；
+          #   od —— 兜底工具。tr/head/sed/awk/printf 默认已含。
+          CONFIG_BUSYBOX_DEFAULT_CRYPTPW=y
+          CONFIG_BUSYBOX_DEFAULT_MKPASSWD=y
+          CONFIG_BUSYBOX_DEFAULT_BASE64=y
+          CONFIG_BUSYBOX_DEFAULT_STAT=y
+          CONFIG_BUSYBOX_DEFAULT_OD=y
+          # ARP 防御主动探测（arping -U）
+          CONFIG_PACKAGE_iputils-arping=y
+
+          # ===== 编译加速（ccache，缓存命中后增量编译 20-40 分钟） =====
+          CONFIG_CCACHE=y
+
+          # ===== 多 WAN 负载均衡（含带宽叠加） =====
+          CONFIG_PACKAGE_luci-app-mwan3=y
+          CONFIG_PACKAGE_mwan3=y
+          CONFIG_PACKAGE_luci-i18n-mwan3-zh-cn=y
+
+          # ===== 智能 QoS =====
+          CONFIG_PACKAGE_luci-app-sqm=y
+          CONFIG_PACKAGE_sqm-scripts=y
+          CONFIG_PACKAGE_luci-i18n-sqm-zh-cn=y
+
+          # ===== DDNS 动态域名 =====
+          CONFIG_PACKAGE_luci-app-ddns=y
+          CONFIG_PACKAGE_ddns-scripts=y
+          CONFIG_PACKAGE_ddns-scripts_aliyun=y
+          CONFIG_PACKAGE_ddns-scripts_no-ip_com=y
+          CONFIG_PACKAGE_luci-i18n-ddns-zh-cn=y
+
+          # ===== UPnP =====
+          CONFIG_PACKAGE_luci-app-upnp=y
+          CONFIG_PACKAGE_miniupnpd=y
+
+          # ===== 网络工具 =====
+          CONFIG_PACKAGE_ppp=y
+          CONFIG_PACKAGE_ppp-mod-pppoe=y
+          CONFIG_PACKAGE_tcpdump=y
+          CONFIG_PACKAGE_nano=y
+          CONFIG_PACKAGE_htop=y
+          CONFIG_PACKAGE_curl=y
+          CONFIG_PACKAGE_ip-full=y
+          CONFIG_PACKAGE_ethtool=y
+
+          # ===== 文件系统支持（把固件装进 SSD/CF 卡） =====
+          # 固件形态：仅 squashfs（根只读 + overlay 可写，防篡改、恢复出厂快）
+          CONFIG_TARGET_ROOTFS_SQUASHFS=y
+          # x86 必须显式开启 gzip 镜像，否则只生成 .img 没有 .img.gz
+          CONFIG_TARGET_IMAGES_GZIP=y
+          CONFIG_PACKAGE_block-mount=y
+          CONFIG_PACKAGE_kmod-usb-storage=y
+          CONFIG_PACKAGE_kmod-usb2=y
+          CONFIG_PACKAGE_kmod-usb3=y
+
+          EOF
+          make defconfig
+          # 双保险：确认基础 dnsmasq 未被拉回（与 dnsmasq-full 冲突会导致 Error 255）
+          if grep -q '^CONFIG_PACKAGE_dnsmasq=y' .config; then
+            echo ">>> dnsmasq 仍为 y，强制关闭（避免与 dnsmasq-full 冲突）"
+            sed -i 's/^CONFIG_PACKAGE_dnsmasq=y/# CONFIG_PACKAGE_dnsmasq is not set/' .config
+            make defconfig
+          fi
+          grep -E '^CONFIG_PACKAGE_dnsmasq' .config || echo "dnsmasq 相关: 均已按需设置"
+          echo "=== 配置完成 ==="
+
+      - name: 开始编译固件
+        run: |
+          # 限制 ccache 上限 2GB：runner 磁盘仅 14GB，防止缓存无限膨胀挤占磁盘
+          ccache -M 2G 2>/dev/null || true
+          echo "=== 编译前磁盘状态 ==="
+          df -h | head -5
+          cd openwrt
+          set -o pipefail
+          make -j$(nproc) V=s 2>&1 | tee build.log
+          echo "=== 编译结束 ==="
+
+      - name: 校验产物
+        run: |
+          cd openwrt/bin/targets/x86/64
+          if ! ls *.img.gz >/dev/null 2>&1; then
+            echo "❌ 未生成固件镜像，打印 build.log 末尾 100 行："
+            cd ../../../..
+            [ -f build.log ] && tail -100 build.log || echo "无 build.log"
+            exit 1
+          fi
+          ls -lh *.img.gz
+          sha256sum *.img.gz > sha256sums.txt
+          echo "=== 产物校验完成 ==="
+
+      - name: 上传固件
+        uses: actions/upload-artifact@v4
+        with:
+          name: golden-openwrt-x86_64
+          path: |
+            openwrt/bin/targets/x86/64/*.img.gz
+            openwrt/bin/targets/x86/64/sha256sums.txt
+            openwrt/bin/targets/x86/64/config.buildinfo
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: 上传完整编译日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: openwrt/build.log
+          if-no-files-found: ignore
+          retention-days: 3
+
+      - name: 汇总日志（供排查）
+        if: always()
+        run: |
+          cd openwrt
+          [ -f build.log ] && tail -50 build.log || echo "无 build.log"
